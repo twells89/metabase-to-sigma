@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "metabase-to-sigma",
+  "displayName": "Metabase → Sigma",
+  "version": "0.1.0",
+  "description": "Migrate Metabase to Sigma — MBQL questions/models (+ database metadata) → Sigma data model, and dashboards → Sigma workbooks. Translates MBQL expressions/aggregations (case→If, count-where→CountIf, datetime-* → Date*) and flags what it can't (cum-sum/offset windows, segment refs, funnel/gauge viz, click behaviors). Includes a read-only estate assessment. Built from public Metabase docs — pending first live validation. Companion to the sigma-migration-skills converters.",
+  "author": { "name": "Thomas Wells" },
+  "license": "MIT",
+  "keywords": ["metabase", "mbql", "sigma", "migration", "bi", "converter", "assessment"],
+  "skills": "./skills/"
+}
