@@ -77,3 +77,16 @@ first live engagement should follow the validation loop in the repo README
   both handled, but the split is version-sensitive).
 - Sigma funnel support: if/when a native funnel element verifies end-to-end,
   upgrade `funnel` from flagged→converted.
+- **Native SQL column refs**: emitted as bare `[Display Name]` (the
+  sigma-data-model-manager production rule). Prior qlik live work used
+  `[Custom SQL/ALIAS]` where the SQL emits matching double-quoted aliases — if
+  the first live POST rejects bare refs on a sql element, that prefix is the fix.
+- **Join-source spec shape** `{kind:'join', joins:[{left, right, joinType,
+  on:[{left,right}]}]}` follows the manager's contract; not yet round-tripped
+  through a live POST from this converter.
+- **100% stacking**: `stackable.stack_type:"normalized"` → `stacking:'percent'`
+  with a verify-warning — the exact Sigma enum value is unconfirmed.
+- **Layout application**: the workbook converter emits a 1:1 24-col `layout`
+  HINT block (element ids change on POST, so pre-baked layout XML would break);
+  `scripts/apply-layout.mjs` currently computes its own per-kind heights — add
+  an exact-grid mode that consumes the hints to preserve the Metabase geometry.

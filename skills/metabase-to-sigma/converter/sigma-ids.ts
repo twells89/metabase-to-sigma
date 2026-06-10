@@ -309,7 +309,10 @@ export function buildDerivedElements(elements: SigmaElement[]): SigmaElement[] {
       if (!rel.name) continue;
       const tgtEl = elements.find(e => e.id === rel.targetElementId);
       if (!tgtEl || tgtEl.source?.kind !== 'warehouse-table') continue;
+      // Skip the relationship's OWN key column(s): a cross-element passthrough of a join key compiles to type "error" in Sigma.
+      const relKeyIds = new Set((rel.keys || []).map(k => k.targetColumnId));
       for (const col of (tgtEl.columns || [])) {
+        if (relKeyIds.has(col.id)) continue;
         if (!col.formula || col.formula.startsWith('/*')) continue;
         const fm = col.formula.match(/^\[([^\]]+)\]$/);
         if (!fm) continue;

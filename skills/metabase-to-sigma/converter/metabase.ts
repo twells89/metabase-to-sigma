@@ -1,0 +1,647 @@
+/**
+ * Metabase → Sigma Data Model converter.   [built from public docs — NOT yet live-validated]
+ *
+ * Input = plain REST JSON (see refs/rest-api.md):
+ *   { metadata?: <GET /api/database/{id}/metadata>, cards: [<GET /api/card/{id}>, …],
+ *     sandboxes?: [<GET /api/mt/gtap> entries — EE row sandboxing, detect-only] }
+ *
+ * Mapping (refs/design-notes.md decisions 1–8):
+ *   referenced warehouse table         → `warehouse-table` element (all metadata fields as raw columns)
+ *   MBQL card with `joins`             → its own element with a `join` source (left/right/inner/full)
+ *   nested question (source "card__N") → element sourced from card N's element (kind:'table')
+ *   native SQL card                    → sql-source element (statement verbatim; NO element name;
+ *                                        {{tags}} flagged with the control to create)
+ *   `expressions`                      → calculated columns (translateMbqlExpr)
+ *   `aggregation` (+ aggregation-options names) → element metrics
+ *   breakout temporal-unit             → DateTrunc calc column
+ *   fk_target_field_id (both tables present)    → DM relationship + derived join view
+ *   sandboxes                          → `security` (DETECT-ONLY — never injected into the model)
+ *
+ * MBQL arrives already parsed (nested JSON arrays), so translateMbqlExpr walks a
+ * tree — no regex DSL parsing. Every row of refs/expression-dsl.md is implemented;
+ * flagged ops (cum-sum, offset, segment, metric, binning) emit a readable
+ * "unmapped" comment placeholder + a loud warning — never silent, never faked.
+ */
+
+import {
+  resetIds, sigmaShortId, sigmaInodeId, sigmaDisplayName, sigmaColFormula,
+  inferSigmaFormat, buildDerivedElements,
+  type SigmaElement, type SigmaColumn, type SigmaMetric, type ConversionResult,
+} from './sigma-ids.js';
+
+// ── options / shared types ────────────────────────────────────────────────────
+
+export interface LearnedRule { pattern: string; template: string; flags?: string }
+
+export interface MetabaseConvertOptions {
+  connectionId?: string;
+  database?: string;       // warehouse database for source paths (e.g. CSA)
+  schema?: string;         // overrides table.schema when set
+  modelName?: string;
+  // Customer-discovered translation rules (gap-scout, ~/.metabase-to-sigma/learned-rules.json).
+  // Applied BEFORE the built-in translator: a rule whose regex matches the FULL
+  // JSON serialization of an MBQL node wins (template may use $1.. captures).
+  learnedRules?: LearnedRule[];
+}
+
+export interface MetabaseFieldInfo {
+  id: number; tableId: number; tableName: string; schema?: string;
+  columnName: string; displayName: string; baseType?: string;
+  fkTargetFieldId?: number | null;
+}
+export interface MetabaseTableInfo { id: number; name: string; schema?: string; fields: MetabaseFieldInfo[]; }
+export interface FieldIndex { byId: Map<number, MetabaseFieldInfo>; tableById: Map<number, MetabaseTableInfo>; }
+
+/** GET /api/database/{id}/metadata → field-id index (MBQL refs columns by integer id). */
+export function buildFieldIndex(metadata: any): FieldIndex {
+  const byId = new Map<number, MetabaseFieldInfo>();
+  const tableById = new Map<number, MetabaseTableInfo>();
+  for (const t of metadata?.tables || []) {
+    const ti: MetabaseTableInfo = { id: t.id, name: t.name, schema: t.schema, fields: [] };
+    for (const f of t.fields || []) {
+      const fi: MetabaseFieldInfo = {
+        id: f.id, tableId: t.id, tableName: t.name, schema: t.schema,
+        columnName: f.name,
+        // Sigma-derived display name (NOT Metabase's display_name) so sibling
+        // bracket refs resolve against the raw-column auto-derived name.
+        displayName: sigmaDisplayName(f.name),
+        baseType: f.base_type, fkTargetFieldId: f.fk_target_field_id ?? null,
+      };
+      ti.fields.push(fi); byId.set(f.id, fi);
+    }
+    tableById.set(t.id, ti);
+  }
+  return { byId, tableById };
+}
+
+// ── MBQL expression tree → Sigma formula ─────────────────────────────────────
+
+export interface MbqlCtx {
+  /** ["field", id|name, opts] → bracketed Sigma ref (DateTrunc-wrapped if temporal-unit). */
+  resolveField: (ref: any) => string;
+  /** Same ref → bare display name (for naming metrics/columns). */
+  fieldDisplay: (ref: any) => string;
+  warn: (msg: string) => void;
+  learnedRules?: LearnedRule[];
+}
+
+const DATEPART: Record<string, string> = {
+  'get-year': 'year', 'get-quarter': 'quarter', 'get-month': 'month', 'get-week': 'week',
+  'get-day': 'day', 'get-day-of-week': 'dayofweek', 'get-hour': 'hour',
+  'get-minute': 'minute', 'get-second': 'second',
+};
+
+export function translateMbqlExpr(node: any, ctx: MbqlCtx): string {
+  // Learned rules first — a validated customer rule beats the built-in translation.
+  // Contract mirrors cognos applyLearnedRules: regex pattern → template, but matched
+  // against the FULL JSON serialization of the node (MBQL is a tree, not a string).
+  if (ctx.learnedRules?.length && typeof node === 'object' && node !== null) {
+    const json = JSON.stringify(node);
+    for (const r of ctx.learnedRules) {
+      try {
+        const re = new RegExp(r.pattern, r.flags || '');
+        const m = json.match(re);
+        if (m && m.index === 0 && m[0].length === json.length) return json.replace(re, r.template);
+      } catch { /* bad rule — skip */ }
+    }
+  }
+  if (node === null || node === undefined) return 'Null';
+  if (typeof node === 'number') return String(node);
+  if (typeof node === 'boolean') return node ? 'True' : 'False';
+  if (typeof node === 'string') return `"${node.replace(/"/g, '\\"')}"`;
+  if (!Array.isArray(node)) {
+    ctx.warn(`unrecognized MBQL node ${JSON.stringify(node).slice(0, 60)} — emitted a placeholder.`);
+    return `/* unmapped: ${JSON.stringify(node).slice(0, 40)} */`;
+  }
+
+  const op = String(node[0]).toLowerCase();
+  const t = (x: any) => translateMbqlExpr(x, ctx);
+  const args = () => node.slice(1).map(t);
+
+  switch (op) {
+    case 'field': return ctx.resolveField(node);
+    case 'expression': return `[${node[1]}]`;                 // sibling custom-column ref
+    case 'value': return t(node[1]);                          // literal wrapper unwraps transparently
+
+    // n-ary arithmetic → left-fold binary
+    case '+': case '-': case '*': case '/': {
+      const a = args();
+      return a.length === 1 ? a[0] : a.reduce((acc, x) => `(${acc} ${op} ${x})`);
+    }
+
+    case 'case': {
+      const clauses: any[] = node[1] || [];
+      const dflt = node[2] && typeof node[2] === 'object' && 'default' in node[2] ? t(node[2].default) : 'Null';
+      let out = dflt;
+      for (let i = clauses.length - 1; i >= 0; i--) out = `If(${t(clauses[i][0])}, ${t(clauses[i][1])}, ${out})`;
+      return out;
+    }
+
+    case 'coalesce': return `Coalesce(${args().join(', ')})`;
+    case 'concat': return `Concat(${args().join(', ')})`;
+    case 'substring': return node[3] !== undefined
+      ? `Mid(${t(node[1])}, ${t(node[2])}, ${t(node[3])})` : `Mid(${t(node[1])}, ${t(node[2])})`;
+    case 'trim': return `Trim(${t(node[1])})`;
+    case 'ltrim': return `LTrim(${t(node[1])})`;
+    case 'rtrim': return `RTrim(${t(node[1])})`;
+    case 'upper': return `Upper(${t(node[1])})`;
+    case 'lower': return `Lower(${t(node[1])})`;
+    case 'length': return `Len(${t(node[1])})`;
+    case 'replace': return `Replace(${t(node[1])}, ${t(node[2])}, ${t(node[3])})`;
+    case 'regex-match-first': return `RegexpExtract(${t(node[1])}, ${t(node[2])})`;
+    case 'split-part': return `SplitPart(${t(node[1])}, ${t(node[2])}, ${t(node[3])})`;
+
+    case 'round': return `Round(${args().join(', ')})`;
+    case 'floor': return `Floor(${t(node[1])})`;
+    case 'ceil': return `Ceiling(${t(node[1])})`;
+    case 'abs': return `Abs(${t(node[1])})`;
+    case 'sqrt': return `Sqrt(${t(node[1])})`;
+    case 'exp': return `Exp(${t(node[1])})`;
+    case 'power': return `Power(${t(node[1])}, ${t(node[2])})`;
+    case 'log': return `Log(${t(node[1])}, 10)`;              // Metabase log is base-10
+
+    case 'datetime-add': return `DateAdd("${node[3]}", ${t(node[2])}, ${t(node[1])})`;
+    case 'datetime-subtract': {
+      const n = node[2];
+      const neg = typeof n === 'number' ? String(-n) : `-(${t(n)})`;
+      return `DateAdd("${node[3]}", ${neg}, ${t(node[1])})`;
+    }
+    case 'datetime-diff': return `DateDiff("${node[3]}", ${t(node[1])}, ${t(node[2])})`;
+    case 'get-year': case 'get-quarter': case 'get-month': case 'get-week':
+    case 'get-day': case 'get-day-of-week': case 'get-hour': case 'get-minute': case 'get-second':
+      return `DatePart("${DATEPART[op]}", ${t(node[1])})`;
+    case 'now': return 'Now()';
+    case 'relative-datetime':
+      return node[1] === 'current' ? 'Today()' : `DateAdd("${node[2]}", ${t(node[1])}, Today())`;
+
+    // comparisons — multi-value `=` ⇒ Or chain (Sigma has NO IsIn); multi `!=` ⇒ And chain
+    case '=': case '!=': {
+      const a = t(node[1]);
+      const vals = node.slice(2).map(t);
+      if (vals.length <= 1) return `${a} ${op} ${vals[0] ?? 'Null'}`;
+      const parts = vals.map((v: string) => `${a} ${op} ${v}`);
+      return op === '=' ? `Or(${parts.join(', ')})` : `And(${parts.join(', ')})`;
+    }
+    case '<': case '<=': case '>': case '>=':
+      return `${t(node[1])} ${op} ${t(node[2])}`;
+    case 'between': return `Between(${t(node[1])}, ${t(node[2])}, ${t(node[3])})`;
+    case 'and': return `And(${args().join(', ')})`;
+    case 'or': return `Or(${args().join(', ')})`;
+    case 'not': return `Not(${t(node[1])})`;
+    case 'is-null': return `IsNull(${t(node[1])})`;
+    case 'not-null': return `IsNotNull(${t(node[1])})`;
+    case 'is-empty': return `Or(IsNull(${t(node[1])}), ${t(node[1])} = "")`;
+    case 'not-empty': return `And(IsNotNull(${t(node[1])}), ${t(node[1])} != "")`;
+
+    case 'starts-with': case 'ends-with': case 'contains': case 'does-not-contain': {
+      const fn = op === 'starts-with' ? 'StartsWith' : op === 'ends-with' ? 'EndsWith' : 'Contains';
+      const opts = node[3] && typeof node[3] === 'object' ? node[3] : {};
+      const caseSensitive = opts['case-sensitive'] === true;
+      const s = t(node[1]), sub = t(node[2]);
+      // Metabase string matching is case-INSENSITIVE by default — wrap in Lower()
+      const body = caseSensitive ? `${fn}(${s}, ${sub})` : `${fn}(Lower(${s}), Lower(${sub}))`;
+      return op === 'does-not-contain' ? `Not(${body})` : body;
+    }
+
+    case 'time-interval': {
+      const f = t(node[1]); const n = node[2]; const unit = node[3];
+      if (n === 'current') return `DateTrunc("${unit}", ${f}) = DateTrunc("${unit}", Today())`;
+      return typeof n === 'number' && n > 0
+        ? `${f} <= DateAdd("${unit}", ${n}, Today())`
+        : `${f} >= DateAdd("${unit}", ${typeof n === 'number' ? n : t(n)}, Today())`;
+    }
+    case 'inside': {
+      // ["inside", latField, lonField, latMax, lonMin, latMin, lonMax] → lat/lon Between pair
+      const [lat, lon, latMax, lonMin, latMin, lonMax] = node.slice(1).map(t);
+      return `And(Between(${lat}, ${latMin}, ${latMax}), Between(${lon}, ${lonMin}, ${lonMax}))`;
+    }
+
+    // ── aggregations (legal at the top of an aggregation clause) ──────────────
+    case 'count': return 'Count()';
+    case 'sum': return `Sum(${t(node[1])})`;
+    case 'avg': return `Avg(${t(node[1])})`;
+    case 'min': return `Min(${t(node[1])})`;
+    case 'max': return `Max(${t(node[1])})`;
+    case 'median': return `Median(${t(node[1])})`;
+    case 'distinct': return `CountDistinct(${t(node[1])})`;
+    case 'stddev': return `StdDev(${t(node[1])})`;
+    case 'var': return `Variance(${t(node[1])})`;
+    case 'percentile': return `Percentile(${t(node[1])}, ${t(node[2])})`;
+    case 'count-where': return `CountIf(${t(node[1])})`;            // condition only — no field arg
+    case 'sum-where': return `SumIf(${t(node[1])}, ${t(node[2])})`; // FIELD FIRST
+    case 'share': return `CountIf(${t(node[1])}) / Count()`;
+    case 'aggregation-options': return t(node[1]);                  // wrapper only supplies the name
+
+    // ── flagged — never faked ──────────────────────────────────────────────────
+    case 'cum-sum': case 'cum-count':
+      ctx.warn(`"${op}" is a running total — rebuild with CumulativeSum in the date-grouped workbook element (window scope lives on the consuming element).`);
+      return `/* unmapped: ${op} */`;
+    case 'offset':
+      ctx.warn('"offset" is a lag/lead window function — rebuild with Lag/window calc in the consuming element.');
+      return '/* unmapped: offset */';
+    case 'segment':
+      ctx.warn(`["segment", ${node[1]}] references a saved segment — inline its MBQL from GET /api/segment/${node[1]} and re-run.`);
+      return `/* unmapped: segment ${node[1]} */`;
+    case 'metric':
+      ctx.warn(`["metric", ${node[1]}] references a saved (legacy) metric — inline its MBQL from GET /api/legacy-metric/${node[1]} and re-run.`);
+      return `/* unmapped: metric ${node[1]} */`;
+    case 'aggregation':
+      ctx.warn(`["aggregation", ${node[1]}] positional ref outside order-by — not resolvable here.`);
+      return `/* unmapped: aggregation ${node[1]} */`;
+
+    default:
+      ctx.warn(`MBQL op "${op}" has no confirmed Sigma mapping — emitted a placeholder; review/translate manually.`);
+      return `/* unmapped: ${op} */`;
+  }
+}
+
+const AGG_LABEL: Record<string, (d: string) => string> = {
+  count: () => 'Count',
+  sum: (d) => `Sum of ${d}`, avg: (d) => `Average of ${d}`, min: (d) => `Min of ${d}`,
+  max: (d) => `Max of ${d}`, median: (d) => `Median of ${d}`,
+  distinct: (d) => `Distinct Count of ${d}`, stddev: (d) => `StdDev of ${d}`,
+  var: (d) => `Variance of ${d}`, percentile: (d) => `Percentile of ${d}`,
+  'count-where': () => 'Count of Matching Rows', 'sum-where': (d) => `Sum of ${d} (Filtered)`,
+  share: () => 'Share of Matching Rows',
+  'cum-sum': (d) => `Cumulative Sum of ${d}`, 'cum-count': () => 'Cumulative Count',
+};
+
+/** Aggregation clause → { formula, name } — named via aggregation-options, else derived ("Sum of Revenue"). */
+export function translateAggregation(node: any, ctx: MbqlCtx): { formula: string; name: string } {
+  let inner = node; let name: string | undefined;
+  if (Array.isArray(node) && String(node[0]).toLowerCase() === 'aggregation-options') {
+    inner = node[1];
+    const o = node[2] || {};
+    name = o['display-name'] || (o.name ? sigmaDisplayName(o.name) : undefined);
+  }
+  const formula = translateMbqlExpr(inner, ctx);
+  if (!name) {
+    const op = Array.isArray(inner) ? String(inner[0]).toLowerCase() : '';
+    const fieldRef = Array.isArray(inner) ? inner.find((x: any) => Array.isArray(x) && x[0] === 'field') : undefined;
+    const disp = fieldRef ? ctx.fieldDisplay(fieldRef) : '';
+    name = AGG_LABEL[op] ? AGG_LABEL[op](disp) : sigmaDisplayName(op || 'Metric');
+  }
+  return { formula, name };
+}
+
+// ── convert ───────────────────────────────────────────────────────────────────
+
+const JOIN_TYPE: Record<string, string> = {
+  'left-join': 'left', 'right-join': 'right', 'inner-join': 'inner', 'full-join': 'full',
+};
+const titleCase = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+
+function normalizeInput(input: any): { metadata?: any; cards: any[]; sandboxes?: any[] } {
+  const root = typeof input === 'string' ? JSON.parse(input) : input;
+  if (Array.isArray(root)) return { cards: root };
+  if (root?.cards) return { metadata: root.metadata, cards: root.cards, sandboxes: root.sandboxes };
+  if (root?.dataset_query) return { cards: [root] };
+  return { metadata: root?.metadata, cards: [], sandboxes: root?.sandboxes };
+}
+
+export function convertMetabaseToSigma(input: string | object, options: MetabaseConvertOptions = {}): ConversionResult {
+  resetIds();
+  const { connectionId = '<CONNECTION_ID>', database = '', schema = '' } = options;
+  const warnings: string[] = [];
+  const inp = normalizeInput(input);
+  const fidx = inp.metadata ? buildFieldIndex(inp.metadata) : null;
+  if (!fidx) warnings.push("no database metadata provided — falling back to each card's result_metadata names (table qualifiers are lost); pass GET /api/database/{id}/metadata as input.metadata.");
+
+  interface ElemCtx {
+    element: SigmaElement; columns: SigmaColumn[]; metrics: SigmaMetric[]; order: string[];
+    colIdByName: Map<string, string>; colIdByFieldId: Map<number, string>;
+    ownedByCard: boolean;   // card-specific element (join/nested/sql) — safe for element filters
+  }
+  const elemCtxs: ElemCtx[] = [];
+  const tableCtxByTableId = new Map<number, ElemCtx>();
+  const newCtx = (element: SigmaElement, ownedByCard: boolean): ElemCtx => {
+    const c: ElemCtx = {
+      element, columns: element.columns as SigmaColumn[], metrics: [], order: element.order as string[],
+      colIdByName: new Map(), colIdByFieldId: new Map(), ownedByCard,
+    };
+    elemCtxs.push(c); return c;
+  };
+
+  const tablePath = (t: MetabaseTableInfo): string[] => {
+    const path: string[] = [database || '<DATABASE>'];
+    const sch = schema || t.schema || '';
+    if (sch) path.push(sch);
+    path.push(t.name.toUpperCase());
+    return path;
+  };
+
+  // Referenced warehouse table → warehouse-table element (one per table, deduped).
+  const ensureTableElement = (tableId: number): ElemCtx | null => {
+    const existing = tableCtxByTableId.get(tableId);
+    if (existing) return existing;
+    const t = fidx?.tableById.get(tableId);
+    if (!t) { warnings.push(`table ${tableId} is not in the database metadata — cannot emit a warehouse-table element for it.`); return null; }
+    const tableTail = t.name.toUpperCase();
+    const element: SigmaElement = {
+      id: sigmaShortId(), kind: 'table', name: sigmaDisplayName(t.name),
+      source: { connectionId, kind: 'warehouse-table', path: tablePath(t) },
+      columns: [], order: [],
+    };
+    const ctx = newCtx(element, false);
+    tableCtxByTableId.set(tableId, ctx);
+    for (const f of t.fields) {
+      const id = sigmaInodeId(f.columnName);
+      ctx.columns.push({ id, formula: sigmaColFormula(tableTail, f.columnName) });
+      ctx.order.push(id);
+      ctx.colIdByName.set(f.displayName.toLowerCase(), id);
+      ctx.colIdByFieldId.set(f.id, id);
+    }
+    return ctx;
+  };
+
+  // Per-card MBQL translation context: field-id resolution via metadata, falling
+  // back to the card's result_metadata names (with a warning — decision 1).
+  const mkMbqlCtx = (card: any): MbqlCtx => {
+    const rmById = new Map<number, any>();
+    for (const rm of card.result_metadata || []) {
+      const fr = rm.field_ref;
+      if (Array.isArray(fr) && fr[0] === 'field' && typeof fr[1] === 'number') rmById.set(fr[1], rm);
+    }
+    const display = (ref: any): string => {
+      const idOrName = Array.isArray(ref) ? ref[1] : ref;
+      if (typeof idOrName === 'number') {
+        const f = fidx?.byId.get(idOrName);
+        if (f) return f.displayName;
+        const rm = rmById.get(idOrName);
+        if (rm) return rm.display_name || sigmaDisplayName(rm.name);
+        warnings.push(`card "${card.name}": field ${idOrName} could not be resolved (no metadata match, no result_metadata match) — emitted [Field ${idOrName}].`);
+        return `Field ${idOrName}`;
+      }
+      return sigmaDisplayName(String(idOrName ?? ''));
+    };
+    const ctx: MbqlCtx = {
+      fieldDisplay: display,
+      resolveField: (ref: any) => {
+        const opts = (Array.isArray(ref) && ref[2]) || {};
+        let out = `[${display(ref)}]`;
+        if (opts['temporal-unit']) out = `DateTrunc("${opts['temporal-unit']}", ${out})`;
+        if (opts.binning) ctx.warn(`numeric binning on [${display(ref)}] is flagged — recreate with BinFixed/BinCount in the workbook element.`);
+        return out;
+      },
+      warn: (m) => warnings.push(`card "${card.name}": ${m}`),
+      learnedRules: options.learnedRules,
+    };
+    return ctx;
+  };
+
+  const parseJoinCondition = (cond: any, ctxM: MbqlCtx): Array<{ left: string; right: string }> => {
+    const out: Array<{ left: string; right: string }> = [];
+    const walk = (c: any) => {
+      if (!Array.isArray(c)) return;
+      const op = String(c[0]).toLowerCase();
+      if (op === 'and') { c.slice(1).forEach(walk); return; }
+      if (op === '=' && c.length === 3) out.push({ left: ctxM.fieldDisplay(c[1]), right: ctxM.fieldDisplay(c[2]) });
+    };
+    walk(cond);
+    return out;
+  };
+
+  // MBQL card with `joins` → its own element with a join source.
+  const buildJoinElement = (card: any, q: any, ctxM: MbqlCtx): ElemCtx | null => {
+    const baseId = q['source-table'];
+    const baseT = typeof baseId === 'number' ? fidx?.tableById.get(baseId) : undefined;
+    if (!baseT) { warnings.push(`card "${card.name}" joins from table ${JSON.stringify(baseId)}, which is not in the metadata — join element skipped.`); return null; }
+    ensureTableElement(baseId);  // base + joined tables also get warehouse-table elements (FK relationships, reuse)
+    const joins: any[] = [];
+    const joinedTables: MetabaseTableInfo[] = [];
+    for (const j of q.joins || []) {
+      const jt = typeof j['source-table'] === 'number' ? fidx?.tableById.get(j['source-table']) : undefined;
+      if (!jt) { warnings.push(`card "${card.name}": join to ${JSON.stringify(j['source-table'])} not resolvable (card-source join or missing metadata) — that join was skipped.`); continue; }
+      ensureTableElement(j['source-table']);
+      joinedTables.push(jt);
+      const on = parseJoinCondition(j.condition, ctxM);
+      if (!on.length) warnings.push(`card "${card.name}": join condition for ${jt.name} is not a simple equi-join — author the ON clause in Sigma.`);
+      joins.push({
+        left: { kind: 'warehouse-table', path: tablePath(baseT) },
+        right: { kind: 'warehouse-table', path: tablePath(jt) },
+        joinType: JOIN_TYPE[j.strategy || 'left-join'] || 'left',
+        on,
+      });
+    }
+    const element: SigmaElement = {
+      id: sigmaShortId(), kind: 'table', name: card.name || `Card ${card.id}`,
+      source: { kind: 'join', connectionId, joins },
+      columns: [], order: [],
+    };
+    const ctx = newCtx(element, true);
+    const addRaw = (t: MetabaseTableInfo) => {
+      for (const f of t.fields) {
+        const key = f.displayName.toLowerCase();
+        if (ctx.colIdByName.has(key)) continue; // duplicate display name (e.g. the join key on both sides) — first wins
+        const id = sigmaInodeId(f.columnName);
+        ctx.columns.push({ id, formula: sigmaColFormula(t.name.toUpperCase(), f.columnName) });
+        ctx.order.push(id);
+        ctx.colIdByName.set(key, id);
+        ctx.colIdByFieldId.set(f.id, id);
+      }
+    };
+    addRaw(baseT);
+    for (const jt of joinedTables) addRaw(jt);
+    return ctx;
+  };
+
+  const addCalc = (ctx: ElemCtx, name: string, formula: string): void => {
+    if (ctx.colIdByName.has(name.toLowerCase())) return; // same-named calc already on this (shared) element
+    const id = sigmaShortId();
+    ctx.columns.push({ id, name, formula });
+    ctx.order.push(id);
+    ctx.colIdByName.set(name.toLowerCase(), id);
+  };
+  const addMetric = (ctx: ElemCtx, name: string, formula: string): void => {
+    if (ctx.metrics.some((m) => m.name === name)) return;
+    const m: SigmaMetric = { id: sigmaShortId(), name, formula };
+    const fmt = inferSigmaFormat(formula, name);
+    if (fmt) (m as any).format = fmt;
+    ctx.metrics.push(m);
+  };
+
+  const cards: any[] = inp.cards || [];
+  const cardById = new Map<number, any>(cards.filter((c) => c?.id != null).map((c) => [c.id, c]));
+  const cardElemId = new Map<number, string>();
+  const inFlight = new Set<number>();
+  let sqlElements = 0;
+
+  const processCard = (card: any): void => {
+    if (!card) return;
+    if (card.id != null && cardElemId.has(card.id)) return;
+    if (card.id != null && inFlight.has(card.id)) { warnings.push(`card ${card.id} participates in a circular card__ reference chain — skipped.`); return; }
+    if (card.id != null) inFlight.add(card.id);
+    const done = () => { if (card.id != null) inFlight.delete(card.id); };
+    const dq = card.dataset_query || {};
+    const ctxM = mkMbqlCtx(card);
+
+    // ── native SQL card → sql-source element (statement verbatim, NO element name) ──
+    if (dq.type === 'native') {
+      const statement = dq.native?.query || '';
+      const element: SigmaElement = {
+        // No `name` field: Sigma derives the sql element's own identifier.
+        id: sigmaShortId(), kind: 'table',
+        source: { kind: 'sql', connectionId, statement },
+        columns: [], order: [],
+      };
+      const ctx = newCtx(element, true);
+      for (const rm of card.result_metadata || []) {
+        const disp = rm.display_name || sigmaDisplayName(rm.name);
+        const id = sigmaShortId();
+        ctx.columns.push({ id, formula: `[${disp}]` });   // bare display-name refs (contract)
+        ctx.order.push(id);
+        ctx.colIdByName.set(disp.toLowerCase(), id);
+      }
+      for (const [tagName, tagRaw] of Object.entries(dq.native?.['template-tags'] || {})) {
+        const tag: any = tagRaw;
+        if (tag?.type === 'dimension') {
+          warnings.push(`card "${card.name}": native {{${tagName}}} is a FIELD FILTER (widget ${tag['widget-type'] || '?'}) — it expands to a whole WHERE clause at runtime; create a Sigma control on the target column + an element filter, and rewrite the SQL (the tag was left verbatim).`);
+        } else if (tag?.type === 'snippet' || tag?.type === 'card') {
+          warnings.push(`card "${card.name}": native {{${tagName}}} references a ${tag.type} — inline it into the SQL before posting.`);
+        } else {
+          warnings.push(`card "${card.name}": native {{${tagName}}} (${tag?.type}) — create a Sigma ${tag?.type} control named "${tag?.['display-name'] || tagName}" (controlId "${tagName}") and rewrite the SQL to reference it; the statement is emitted verbatim.`);
+        }
+      }
+      if (card.id != null) cardElemId.set(card.id, element.id);
+      sqlElements++;
+      done();
+      return;
+    }
+
+    // ── MBQL card ────────────────────────────────────────────────────────────────
+    const q = dq.query || {};
+    const src = q['source-table'];
+    let target: ElemCtx | null = null;
+
+    if (typeof src === 'string' && src.startsWith('card__')) {
+      // Nested question — sourced from card N's element when card N is in the input set.
+      const n = Number(src.slice('card__'.length));
+      const parent = cardById.get(n);
+      if (!parent) { warnings.push(`card "${card.name}" is a nested question on card ${n}, which is NOT in the input set — fetch GET /api/card/${n}, add it, and re-run; card skipped.`); done(); return; }
+      processCard(parent);
+      const parentElemId = cardElemId.get(n);
+      if (!parentElemId) { warnings.push(`card "${card.name}": its source card ${n} did not produce an element — skipped.`); done(); return; }
+      const element: SigmaElement = {
+        id: sigmaShortId(), kind: 'table', name: card.name || `Card ${card.id}`,
+        source: { kind: 'table', elementId: parentElemId },
+        columns: [], order: [],
+      };
+      target = newCtx(element, true);
+    } else if (Array.isArray(q.joins) && q.joins.length) {
+      target = buildJoinElement(card, q, ctxM);
+    } else if (typeof src === 'number') {
+      target = ensureTableElement(src);
+      if (!target) warnings.push(`card "${card.name}" skipped — its source table ${src} is unknown.`);
+    } else if (src !== undefined) {
+      warnings.push(`card "${card.name}": unrecognized source-table ${JSON.stringify(src)} — skipped.`);
+    }
+    if (!target) { done(); return; }
+    if (card.id != null) cardElemId.set(card.id, target.element.id);
+
+    // expressions → calculated columns
+    for (const [name, expr] of Object.entries(q.expressions || {})) {
+      addCalc(target, String(name), translateMbqlExpr(expr, ctxM));
+    }
+    // breakout temporal-unit → DateTrunc calc column (plain breakouts are already raw columns)
+    for (const b of q.breakout || []) {
+      const unit = Array.isArray(b) && b[2]?.['temporal-unit'];
+      if (unit) addCalc(target, `${ctxM.fieldDisplay(b)} (${titleCase(String(unit))})`, ctxM.resolveField(b));
+      else if (Array.isArray(b) && b[2]?.binning) ctxM.resolveField(b); // emits the binning warning
+    }
+    // aggregations → element metrics
+    for (const a of q.aggregation || []) {
+      const { formula, name } = translateAggregation(a, ctxM);
+      addMetric(target, name, formula);
+    }
+    // card filter: safe on a card-owned element; NEVER on a shared table element
+    // (an element filter on a shared-source element propagates into every consumer).
+    if (q.filter) {
+      const formula = translateMbqlExpr(q.filter, ctxM);
+      if (target.ownedByCard) {
+        const id = sigmaShortId();
+        target.columns.push({ id, name: `Filter: ${card.name || card.id}`, formula, hidden: true });
+        ((target.element as any).filters ||= []).push({ id: sigmaShortId(), columnId: id, kind: 'list', mode: 'include', values: [true] });
+      } else {
+        warnings.push(`card "${card.name}": its MBQL filter translates to ${formula} — NOT applied to the shared "${target.element.name}" element (a filter there would propagate to every consumer); apply it on the consuming workbook element.`);
+      }
+    }
+    if (q.limit != null && !target.ownedByCard) {
+      warnings.push(`card "${card.name}": row limit ${q.limit} not ported — never cap a shared DM element; apply a top-N on the consuming workbook element if needed.`);
+    }
+    done();
+  };
+
+  for (const card of cards) processCard(card);
+
+  // ── FK metadata → relationships on the fact-side element (both tables present) ──
+  let relationshipCount = 0;
+  for (const [tableId, ctx] of tableCtxByTableId) {
+    const t = fidx?.tableById.get(tableId);
+    if (!t) continue;
+    for (const f of t.fields) {
+      if (!f.fkTargetFieldId) continue;
+      const tgtField = fidx!.byId.get(f.fkTargetFieldId);
+      if (!tgtField) continue;
+      const tgtCtx = tableCtxByTableId.get(tgtField.tableId);
+      if (!tgtCtx) continue;  // both tables must be present in the model
+      const sourceColumnId = ctx.colIdByFieldId.get(f.id);
+      const targetColumnId = tgtCtx.colIdByFieldId.get(tgtField.id);
+      if (!sourceColumnId || !targetColumnId) continue;
+      (ctx.element.relationships ||= []).push({
+        id: sigmaShortId(),
+        name: tgtField.tableName.toUpperCase(),   // relationship name = target table path tail, uppercase
+        targetElementId: tgtCtx.element.id,
+        keys: [{ sourceColumnId, targetColumnId }],
+      });
+      relationshipCount++;
+    }
+  }
+
+  // ── finalize ──────────────────────────────────────────────────────────────────
+  const elements: SigmaElement[] = [];
+  for (const ctx of elemCtxs) {
+    if (ctx.metrics.length) (ctx.element as any).metrics = ctx.metrics;
+    elements.push(ctx.element);
+  }
+  for (const de of buildDerivedElements(elements)) elements.push(de);
+
+  // ── Metabase sandboxing (EE row security) — DETECT-ONLY, never injected ───────
+  const security = (inp.sandboxes || []).map((s: any) => {
+    const tname = fidx?.tableById.get(s.table_id)?.name || `table ${s.table_id}`;
+    const parts = Object.entries(s.attribute_remappings || {}).map(([attr, tgt]: [string, any]) => {
+      const tgtRef = Array.isArray(tgt) && tgt[0] === 'dimension' ? tgt[1] : tgt;
+      const col = Array.isArray(tgtRef) && tgtRef[0] === 'field'
+        ? (fidx?.byId.get(tgtRef[1])?.displayName || `field ${tgtRef[1]}`)
+        : JSON.stringify(tgt);
+      return `[${col}] = user attribute "${attr}"`;
+    });
+    return {
+      type: 'row-filter',
+      name: s.name || `Sandbox: ${tname}`,
+      expression: parts.length ? parts.join(' AND ') : (s.card_id != null ? `rows restricted to saved question ${s.card_id}` : '(no attribute remappings found)'),
+      groups: [s.group_id].filter((g: any) => g != null),
+    };
+  });
+  if (security.length) {
+    warnings.push(`SECURITY: ${security.length} Metabase sandbox(es) detected — NOT ported into the model spec. ` +
+      `Run the skill's RLS flow (scripts/apply_sigma_rls.py) after posting the model; skipping leaves ALL rows visible to everyone.`);
+  }
+
+  const stats = {
+    cards: cards.length,
+    elements: elements.length,
+    sqlElements,
+    columns: elements.reduce((n, e) => n + (e.columns?.length || 0), 0),
+    metrics: elements.reduce((n, e) => n + ((e as any).metrics?.length || 0), 0),
+    relationships: relationshipCount,
+  };
+  return {
+    model: {
+      name: options.modelName || inp.metadata?.name || 'Metabase Data Model',
+      schemaVersion: 1,
+      pages: [{ id: sigmaShortId(), name: 'Page 1', elements }],
+    },
+    warnings, stats,
+    ...(security.length ? { security } : {}),
+  };
+}
