@@ -59,9 +59,13 @@ export function sigmaDisplayName(s: string): string {
   // translator more than once, and same-element sibling refs are resolved
   // case-SENSITIVELY by Sigma — a non-idempotent derivation ("Cyq Rev" → "Cyq rev")
   // breaks the ref and the column compiles to type "error".
+  // AP-style: FIRST and LAST words always capitalize, stopwords only stay lowercase
+  // mid-name (live-verified: IS_EMAIL_OPT_IN → "Is Email Opt In", DAYS_TO_SHIP →
+  // "Days to Ship"; cross-element refs are case-SENSITIVE so a wrong-case trailing
+  // stopword compiles to type "error").
   const words = normalized.toLowerCase().split(/[_\s]+/).filter(Boolean);
   return words.map((w, i) =>
-    (i === 0 || !SIGMA_LOWERCASE_WORDS.has(w))
+    (i === 0 || i === words.length - 1 || !SIGMA_LOWERCASE_WORDS.has(w))
       ? w.charAt(0).toUpperCase() + w.slice(1)
       : w
   ).join(' ');

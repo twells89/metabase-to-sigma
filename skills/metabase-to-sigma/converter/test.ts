@@ -39,11 +39,14 @@ const nativeCard = read('top-customers-native.card.json');
     && JSON.stringify(customerDim?.source?.path) === JSON.stringify(['CSA', 'TJ', 'CUSTOMER_DIM']));
   check('dm', 'field-id resolution: plain column = inode id + [TABLE/Display] formula',
     orderFact?.columns?.some((c: any) => /^inode-.{22}\/SALES_AMOUNT$/.test(c.id) && c.formula === '[ORDER_FACT/Sales Amount]'));
-  check('dm', 'join element: source kind join, joinType left, on Customer Key = Customer Key',
+  check('dm', 'join element: live contract — columns key, left-outer, named sides, [Display] refs',
     joinEl?.source?.kind === 'join'
-    && joinEl?.source?.joins?.[0]?.joinType === 'left'
-    && joinEl?.source?.joins?.[0]?.on?.[0]?.left === 'Customer Key'
-    && joinEl?.source?.joins?.[0]?.on?.[0]?.right === 'Customer Key');
+    && typeof joinEl?.source?.name === 'string'
+    && joinEl?.source?.joins?.[0]?.joinType === 'left-outer'
+    && typeof joinEl?.source?.joins?.[0]?.name === 'string'
+    && joinEl?.source?.joins?.[0]?.left?.connectionId !== undefined
+    && joinEl?.source?.joins?.[0]?.columns?.[0]?.left === '[Customer Key]'
+    && joinEl?.source?.joins?.[0]?.columns?.[0]?.right === '[Customer Key]');
   check('dm', 'arithmetic expression: Net Amount = ([Sales Amount] - [Discount Amount])',
     col(joinEl, 'Net Amount')?.formula === '([Sales Amount] - [Discount Amount])');
   check('dm', 'case → If, multi-value = → Or chain (no IsIn)',
@@ -60,8 +63,8 @@ const nativeCard = read('top-customers-native.card.json');
     !orderFact?.filters && r.warnings.some((w) => /NOT applied to the shared/.test(w) && /DateAdd\("day", -365, Today\(\)\)/.test(w)));
   check('dm', 'native SQL card → sql-source element with NO element-level name',
     !!sqlEl && sqlEl.name === undefined && /SELECT/.test(sqlEl.source.statement));
-  check('dm', 'native sql columns are bare [Display Name] refs',
-    sqlEl?.columns?.some((c: any) => c.formula === '[Revenue]'));
+  check('dm', 'native sql columns are [Custom SQL/RAW_ALIAS] refs with names (bare refs error live)',
+    sqlEl?.columns?.some((c: any) => /^\[Custom SQL\//.test(c.formula) && typeof c.name === 'string'));
   check('dm', 'plain text {{tag}} warns with the control to create',
     r.warnings.some((w) => /\{\{region\}\}/.test(w) && /control/.test(w) && /"region"/.test(w)));
   check('dm', 'dimension {{tag}} (field filter) is flagged',
@@ -137,8 +140,8 @@ const nativeCard = read('top-customers-native.card.json');
   check('wb', 'schemaVersion is 1', wb.schemaVersion === 1);
   check('wb', 'one page per dashboard tab (Overview, Detail)',
     wb.pages.length === 2 && wb.pages[0].name === 'Overview' && wb.pages[1].name === 'Detail');
-  check('wb', 'text dashcard → text element with the markdown',
-    els.some((e) => e.kind === 'text' && /## Executive Overview/.test(e.text)));
+  check('wb', 'text dashcard → text element with the markdown in body (live contract)',
+    els.some((e) => e.kind === 'text' && /## Executive Overview/.test((e as any).body)));
   const kpi = byName('Total Revenue');
   check('wb', 'scalar → kpi-chart with value {columnId} (NOT {id})',
     kpi?.kind === 'kpi-chart' && !!kpi.value?.columnId && kpi.value?.id === undefined);
@@ -163,8 +166,8 @@ const nativeCard = read('top-customers-native.card.json');
     && pivot.rowsBy?.length === 1 && typeof pivot.rowsBy[0] === 'object' && !!pivot.rowsBy[0].id
     && pivot.columnsBy?.length === 1 && !!pivot.columnsBy[0].id
     && pivot.values?.length === 1 && typeof pivot.values[0] === 'string');
-  check('wb', 'joined card sources the derived view placeholder',
-    pivot?.source?.elementId === 'Order Fact View');
+  check('wb', 'explicit-join card sources its own card-named join element (exact columns, no dedup suffixes)',
+    pivot?.source?.elementId === 'Revenue by Region and Tier');
   const funnel = byName('Tier Funnel (was funnel)');
   check('wb', 'funnel → table element + LOUD warning (never fake a viz)',
     funnel?.kind === 'table' && r.warnings.some((w) => /funnel/.test(w) && /TABLE/.test(w)));
@@ -180,8 +183,8 @@ const nativeCard = read('top-customers-native.card.json');
     bar?.columns?.some((c: any) => c.hidden && c.formula === '[Region] = [region]')
     && bar?.filters?.some((f: any) => f.kind === 'list' && f.mode === 'include' && f.values[0] === true)
     && line?.columns?.some((c: any) => c.hidden && c.formula === '[Order Date] = [date_range]'));
-  check('wb', 'element source placeholders are DM element NAMES (remap rewrites them)',
-    line?.source?.kind === 'table' && line?.source?.elementId === 'Order Fact'
+  check('wb', 'element source placeholders are DM element NAMES on data-model sources (remap rewrites)',
+    line?.source?.kind === 'data-model' && line?.source?.elementId === 'Order Fact'
     && bar?.source?.elementId === 'Customer Dim');
   check('wb', 'layout hints preserve the 1:1 24-col grid',
     r.layout.grid === 24
@@ -216,8 +219,9 @@ const nativeCard = read('top-customers-native.card.json');
     && ctrl('region')?.controlType === 'text' && ctrl('region')?.value === 'West');
   check('pmbql', 'number tag → number control with default',
     ctrl('min_qty')?.controlType === 'number' && ctrl('min_qty')?.value === 1);
-  check('pmbql', 'field-filter tag neutralized to 1=1 + documented comment',
-    /1=1 \/\* Metabase field filter \{\{order_date\}\} → filter \[Order Date\]/.test(tagged?.source.statement || ''));
+  check('pmbql', 'field-filter tag neutralized to 1=1 + brace-free comment (Sigma parses {{}} in comments)',
+    /1=1 \/\* Metabase field filter 'order_date' → filter \[Order Date\]/.test(tagged?.source.statement || '')
+    && !/\{\{order_date\}\}/.test(tagged?.source.statement || ''));
   check('pmbql', 'optional [[…]] block without a default DROPPED + warned',
     !/\{\{tier\}\}/.test(tagged?.source.statement || '') && r.warnings.some((w) => /\[\[…\]\] block DROPPED/.test(w) && /tier/.test(w)));
   check('pmbql', 'card tag {{#400…}} inlined as a sub-select from the referenced native card',
@@ -232,9 +236,9 @@ const nativeCard = read('top-customers-native.card.json');
     r.warnings.some((w) => /Or\(\[Order Number\] = 100, \[Order Number\] = 200\)/.test(w))
     && r.warnings.some((w) => /\[Order Date\] >= DateAdd\("month", -6, Today\(\)\)/.test(w)));
   const joinEl = els.find((e) => e.name === 'Orders with Customers (pMBQL Join)');
-  check('pmbql', 'pMBQL join {stages, conditions} → join source on Customer Key',
-    joinEl?.source?.kind === 'join' && joinEl?.source?.joins?.[0]?.joinType === 'left'
-    && joinEl?.source?.joins?.[0]?.on?.[0]?.left === 'Customer Key');
+  check('pmbql', 'pMBQL join {stages, conditions} → join source on Customer Key (live shape)',
+    joinEl?.source?.kind === 'join' && joinEl?.source?.joins?.[0]?.joinType === 'left-outer'
+    && joinEl?.source?.joins?.[0]?.columns?.[0]?.left === '[Customer Key]');
   check('pmbql', 'expression list (lib/expression-name) → calc columns: case→If, date()→DateTrunc day',
     of?.columns?.some((c: any) => c.name === 'Size Bucket' && c.formula === 'If([Sales Amount] > 1000, "Large", "Small")')
     && of?.columns?.some((c: any) => c.name === 'Days to Now' && c.formula === 'DateDiff("day", [Order Date], Now())')
@@ -287,8 +291,8 @@ const nativeCard = read('top-customers-native.card.json');
   check('pmbql-wb', 'object display → flagged detail-view table',
     els.some((e) => e.kind === 'table' && e.name === 'Order Record (object detail)')
     && r.warnings.some((w) => /object DETAIL view/.test(w)));
-  check('pmbql-wb', 'virtual text card still passes markdown through',
-    els.some((e) => e.kind === 'text' && /## Ops Notes/.test(e.text)));
+  check('pmbql-wb', 'virtual text card still passes markdown through (body field)',
+    els.some((e) => e.kind === 'text' && /## Ops Notes/.test((e as any).body)));
 }
 
 // ── the two pmbql-normalize.mjs copies must stay byte-identical ──────────────

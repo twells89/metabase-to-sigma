@@ -191,10 +191,15 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
       const t = fidx?.tableById.get(src);
       if (!t) { warnings.push(`card "${card.name}": source table ${src} not in metadata — emitted placeholder "table_${src}".`); return `table_${src}`; }
       if (Array.isArray(q.joins) && q.joins.length) {
-        // a joined card reads from the DM's derived join view, which denormalizes the dims
-        warnings.push(`card "${card.name}" uses MBQL joins — sourced from the derived "${sigmaDisplayName(t.name)} View" element; verify the joined columns it needs are exposed there.`);
-        return `${sigmaDisplayName(t.name)} View`;
+        // The DM converter gives every MBQL-join card its OWN join element, named
+        // after the card, with exactly the card's columns. Source that — the generic
+        // FK-derived "<Table> View" suffixes duplicate columns ("Category (PRODUCT_DIM)")
+        // so card-named refs 400 against it (live-verified "Dependency not found").
+        return card.name || `${sigmaDisplayName(t.name)} View`;
       }
+      // Implicit FK joins (source-field refs) need the dim columns the base table
+      // doesn't have — read from the FK-derived "<Table> View" element instead.
+      if (JSON.stringify(q).includes('"source-field"')) return `${sigmaDisplayName(t.name)} View`;
       return sigmaDisplayName(t.name);
     }
     warnings.push(`card "${card.name}": unrecognized source ${JSON.stringify(src)} — emitted placeholder "<element>".`);
@@ -270,8 +275,21 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
         ...(q.aggregation || []).map((_: any, i: number) => ({ name: `agg${i}`, display_name: '', field_ref: ['aggregation', i] })),
       ];
     }
+    let aggSeq = 0;
     for (const rm of rms) {
-      const fr = rm.field_ref;
+      if (rm.name === 'pivot-grouping') continue; // Metabase-internal pivot column
+      let fr = rm.field_ref;
+      // Pivot (and some cached) result_metadata carries field_ref: null — reconstruct
+      // from the MBQL by name (agg result cols are named sum/count/avg/…; live-verified).
+      if (!Array.isArray(fr) && q) {
+        const nmLower = String(rm.name || '').toLowerCase();
+        if (q.aggregation?.length && /^(sum|count|avg|min|max|stddev|distinct|share|cum_sum|cum_count)(_\d+)?$/.test(nmLower)) {
+          fr = ['aggregation', Math.min(aggSeq++, q.aggregation.length - 1)];
+        } else {
+          const b = (q.breakout || []).find((br: any) => ctx.fieldDisplay(br).toLowerCase() === String(rm.display_name || rm.name || '').toLowerCase());
+          if (b) fr = b;
+        }
+      }
       let formula = ''; let isMetric = false; let nm = rm.display_name || sigmaDisplayName(rm.name || 'Column');
       if (Array.isArray(fr) && fr[0] === 'aggregation') {
         const agg = q?.aggregation?.[fr[1]];
@@ -322,7 +340,9 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
     if (dc.cardId == null && vs.virtual_card) {
       const display = vs.virtual_card.display;
       if (display === 'text' || display === 'heading') {
-        return { id: sigmaShortId(), kind: 'text', name: 'Text', text: vs.text || '' };
+        // Live contract: text elements carry `body` (string), not `text` —
+        // POST 400s "body: Invalid string: undefined".
+        return { id: sigmaShortId(), kind: 'text', name: 'Text', body: vs.text || '' } as any;
       }
       warnings.push(`virtual card (display "${display}") is not a text/heading — skipped (link/action cards have no Sigma spec analog).`);
       return null;
@@ -349,7 +369,9 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
       } catch { /* unparseable column_settings key — ignore */ }
     }
 
-    const source: Record<string, any> = { kind: 'table', elementId: sourceName };
+    // Cross-document DM references are kind 'data-model' (kind 'table' is for
+    // same-workbook elements — live-verified 400 "Dependency not found").
+    const source: Record<string, any> = { kind: 'data-model', elementId: sourceName };
     if (options.dataModelId) source.dataModelId = options.dataModelId;
     const el: WbElement = {
       id: sigmaShortId(), kind: DISPLAY_KIND[display] || 'table', name: card.name || `Card ${card.id}`,
@@ -444,9 +466,11 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
       }
       if (xIds.length > 1) el.color = { by: 'category', column: xIds[1] };  // 2nd dimension = series color
       if (display === 'row') el.orientation = 'horizontal';  // 'horizontal' is the ONLY valid value; vertical bar OMITS the key
+      // Live-verified enum: none | stacked | normalized (Metabase's 'normalized'
+      // passes through verbatim; 'percent' is rejected "Invalid value: string").
       const stack = vs['stackable.stack_type'];
       if (stack === 'stacked') el.stacking = 'stacked';
-      else if (stack === 'normalized') { el.stacking = 'percent'; warnings.push(`card "${card.name}": 100%-stacked emitted as stacking:"percent" — verify the enum against the live spec.`); }
+      else if (stack === 'normalized') el.stacking = 'normalized';
     }
     // display === 'table' → plain table element: columns + order already set.
 

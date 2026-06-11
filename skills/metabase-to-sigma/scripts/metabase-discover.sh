@@ -24,12 +24,15 @@ import sys,json
 for c in json.load(sys.stdin):
     if isinstance(c, dict):
         kind = "personal" if c.get("personal_owner_id") else "shared"
-        print(f"{str(c.get(\"id\")):>6}  {kind:8}  {c.get(\"location\") or \"/\":12}  {c.get(\"name\")}")' ;;
+        cid, loc, name = str(c.get("id")), c.get("location") or "/", c.get("name")
+        print(f"{cid:>6}  {kind:8}  {loc:12}  {name}")' ;;
   items)
     req "/api/collection/$id/items?models=card&models=dashboard&models=dataset&limit=200" | python3 -c '
 import sys,json
 d=json.load(sys.stdin)
-for i in d.get("data", []): print(f"{i.get(\"model\",\"?\"):10} {str(i.get(\"id\")):>6}  {i.get(\"name\")}")
+for i in d.get("data", []):
+    model, iid, name = i.get("model", "?"), str(i.get("id")), i.get("name")
+    print(f"{model:10} {iid:>6}  {name}")
 t=d.get("total"); n=len(d.get("data", []))
 if t and t > n: print(f"… {t-n} more — paginate with &offset={n}", file=sys.stderr)' ;;
   card)      req "/api/card/$id" ;;
@@ -38,7 +41,9 @@ if t and t > n: print(f"… {t-n} more — paginate with &offset={n}", file=sys.
     req "/api/database" | python3 -c '
 import sys,json
 d=json.load(sys.stdin); rows=d.get("data") if isinstance(d, dict) else d
-for db in rows or []: print(f"{str(db.get(\"id\")):>4}  {db.get(\"engine\",\"?\"):12}  {db.get(\"name\")}")' ;;
+for db in rows or []:
+    did, eng, name = str(db.get("id")), db.get("engine", "?"), db.get("name")
+    print(f"{did:>4}  {eng:12}  {name}")' ;;
   metadata)  req "/api/database/$id/metadata" ;;
   *) echo "usage: metabase-discover.sh {collections | items <id> | card <id> | dashboard <id> | databases | metadata <dbId>}" >&2; exit 1 ;;
 esac

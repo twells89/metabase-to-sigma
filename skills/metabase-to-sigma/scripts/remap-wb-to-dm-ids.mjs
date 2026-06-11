@@ -23,15 +23,93 @@ if (!els.length) { console.error(`No elements found on data model ${dmId} (token
 const byName = new Map(els.map((e) => [e.name.toLowerCase(), e.id]));
 
 let remapped = 0; const unresolved = [];
+// Column-set fallback: Sigma does NOT honor sql-element names (all read back as
+// "Custom SQL"), so native-card placeholders never match by name. Fingerprint each
+// DM element by its column display names and match the workbook element's bare
+// [Col] refs against them (best unique superset wins).
+// Normalize: DM sql columns keep RAW aliases (NET_REVENUE), workbook refs are
+// prettified (Net Revenue) — compare alphanumerics only.
+const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+const colEntries = (await api('GET', `/v2/dataModels/${dmId}/columns?limit=500`)).json?.entries || [];
+const colsByElement = new Map();
+for (const c of colEntries) {
+  if (!colsByElement.has(c.elementId)) colsByElement.set(c.elementId, new Set());
+  colsByElement.get(c.elementId).add(norm(c.name));
+}
+const wantedCols = (e) => {
+  const names = new Set();
+  for (const c of e.columns || []) {
+    const m = /^\[([^\]/]+)\]$/.exec(String(c.formula || ''));
+    if (m) names.add(norm(m[1]));
+  }
+  return names;
+};
+const byColumns = (e) => {
+  const want = wantedCols(e);
+  if (!want.size) return undefined;
+  const hits = [];
+  for (const [elId, have] of colsByElement) {
+    if ([...want].every((n) => have.has(n))) hits.push({ elId, extra: have.size - want.size });
+  }
+  if (!hits.length) return undefined;
+  // Smallest superset wins (a native card's sql element carries EXACTLY its result
+  // columns; wide base tables also match but with many extras). Tie → ambiguous.
+  hits.sort((x, y) => x.extra - y.extra);
+  if (hits.length > 1 && hits[0].extra === hits[1].extra) return undefined;
+  return hits[0].elId;
+};
+
+// Ref repair: workbook formulas must be [<DM element name>/<ACTUAL column name>]
+// (DM sql elements keep RAW aliases like NET_REVENUE; derived views suffix duplicate
+// names like "Category (PRODUCT_DIM)"). Bare or prettified refs POST 200 but resolve
+// to type "error" — rewrite every bracket token against the live DM columns.
+const nameByElement = new Map(els.map((e) => [e.id, e.name]));
+const colNamesByElement = new Map(); // elId -> Map(norm -> [actual names])
+for (const c of colEntries) {
+  if (!colNamesByElement.has(c.elementId)) colNamesByElement.set(c.elementId, new Map());
+  const m = colNamesByElement.get(c.elementId);
+  const n = norm(c.name);
+  if (!m.has(n)) m.set(n, []);
+  if (!m.get(n).includes(c.name)) m.get(n).push(c.name);
+}
+let repaired = 0; const unrepairable = [];
+const repairRefs = (e, elId) => {
+  const elName = nameByElement.get(elId);
+  const colMap = colNamesByElement.get(elId);
+  if (!elName || !colMap) return;
+  const resolveCol = (token) => {
+    const n = norm(token);
+    const exact = colMap.get(n);
+    if (exact?.length === 1) return exact[0];
+    // tolerate the derived-view disambiguation suffix: Category -> "Category (PRODUCT_DIM)"
+    const cands = [];
+    for (const [k, names] of colMap) {
+      if (k !== n && k.startsWith(n)) cands.push(...names.filter((nm) => /\(.+\)\s*$/.test(nm)));
+    }
+    return cands.length === 1 ? cands[0] : undefined;
+  };
+  for (const c of e.columns || []) {
+    if (typeof c.formula !== 'string') continue;
+    c.formula = c.formula.replace(/\[([^\]]+)\]/g, (whole, inner) => {
+      const slash = inner.indexOf('/');
+      const colTok = slash >= 0 ? inner.slice(slash + 1) : inner;
+      const real = resolveCol(colTok);
+      if (!real) { unrepairable.push(`${e.name || e.id}: ${whole}`); return whole; }
+      repaired++;
+      return `[${elName}/${real}]`;
+    });
+  }
+};
+
 for (const p of wb.pages || []) for (const e of p.elements || []) {
   const s = e.source; if (!s || !('elementId' in s)) continue;
   s.dataModelId = dmId;
   const want = String(s.elementId || '').toLowerCase();
-  const real = byName.get(want) || (els.length === 1 ? els[0].id : undefined);
-  if (real) { s.elementId = real; remapped++; } else unresolved.push(s.elementId);
+  const real = byName.get(want) || byColumns(e) || (els.length === 1 ? els[0].id : undefined);
+  if (real) { s.elementId = real; remapped++; repairRefs(e, real); } else unresolved.push(s.elementId);
 }
 
 const out = a.out || a.wb.replace(/\.json$/, '.remapped.json');
 writeFileSync(out, JSON.stringify(wb, null, 2));
-console.log(JSON.stringify({ dataModelId: dmId, dmElements: els.length, remapped, unresolved, out }, null, 2));
+console.log(JSON.stringify({ dataModelId: dmId, dmElements: els.length, remapped, repaired, unrepairable, unresolved, out }, null, 2));
 if (unresolved.length) { console.error(`WARN: ${unresolved.length} elementId(s) unresolved — DM has no element named: ${unresolved.join(', ')}`); process.exit(1); }

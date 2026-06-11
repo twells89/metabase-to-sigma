@@ -297,8 +297,9 @@ export function translateAggregation(node: any, ctx: MbqlCtx): { formula: string
 
 // ── convert ───────────────────────────────────────────────────────────────────
 
+// Live-verified enum: inner | left-outer | right-outer | full-outer | lookup.
 const JOIN_TYPE: Record<string, string> = {
-  'left-join': 'left', 'right-join': 'right', 'inner-join': 'inner', 'full-join': 'full',
+  'left-join': 'left-outer', 'right-join': 'right-outer', 'inner-join': 'inner', 'full-join': 'full-outer',
 };
 const titleCase = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
 
@@ -391,6 +392,13 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
       fieldDisplay: display,
       resolveField: (ref: any) => {
         const opts = (Array.isArray(ref) && ref[2]) || {};
+        // Implicit FK join ([field, dimField, {source-field}]) — the dim table must
+        // exist as an element or the FK relationship (and the derived view column
+        // the consuming chart needs) is silently dropped (live-verified).
+        if (opts['source-field'] && Array.isArray(ref) && typeof ref[1] === 'number') {
+          const f = fidx?.byId.get(ref[1]);
+          if (f) ensureTableElement(f.tableId);
+        }
         let out = `[${display(ref)}]`;
         if (opts['temporal-unit']) out = `DateTrunc("${opts['temporal-unit']}", ${out})`;
         if (opts.binning) ctx.warn(`numeric binning on [${display(ref)}] is flagged — recreate with BinFixed/BinCount in the workbook element.`);
@@ -403,12 +411,22 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
   };
 
   const parseJoinCondition = (cond: any, ctxM: MbqlCtx): Array<{ left: string; right: string }> => {
+    // Join-condition refs are bare [Column] scoped to each side, using Sigma's
+    // PRETTIFIED display name of the physical column ('[Product Key]'; the physical
+    // '[PRODUCT_KEY]' 400s "Column reference not found" — live-verified).
+    const rawCol = (ref: any): string => {
+      if (Array.isArray(ref) && ref[0] === 'field' && typeof ref[1] === 'number') {
+        const f = fidx?.byId.get(ref[1]);
+        if (f) return `[${sigmaDisplayName(f.columnName)}]`;
+      }
+      return `[${ctxM.fieldDisplay(ref)}]`;
+    };
     const out: Array<{ left: string; right: string }> = [];
     const walk = (c: any) => {
       if (!Array.isArray(c)) return;
       const op = String(c[0]).toLowerCase();
       if (op === 'and') { c.slice(1).forEach(walk); return; }
-      if (op === '=' && c.length === 3) out.push({ left: ctxM.fieldDisplay(c[1]), right: ctxM.fieldDisplay(c[2]) });
+      if (op === '=' && c.length === 3) out.push({ left: rawCol(c[1]), right: rawCol(c[2]) });
     };
     walk(cond);
     return out;
@@ -430,15 +448,21 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
       const on = parseJoinCondition(j.condition, ctxM);
       if (!on.length) warnings.push(`card "${card.name}": join condition for ${jt.name} is not a simple equi-join — author the ON clause in Sigma.`);
       joins.push({
-        left: { kind: 'warehouse-table', path: tablePath(baseT) },
-        right: { kind: 'warehouse-table', path: tablePath(jt) },
-        joinType: JOIN_TYPE[j.strategy || 'left-join'] || 'left',
-        on,
+        // connectionId is REQUIRED on each join side (nested sources carry their own
+        // connection — live-verified 400 "joins[0].left.connectionId: Invalid string").
+        // Conditions live in `columns` (not `on`), and the relationship `name` is the
+        // formula prefix for this right source's columns ([NAME/Col]).
+        left: { kind: 'warehouse-table', connectionId, path: tablePath(baseT) },
+        right: { kind: 'warehouse-table', connectionId, path: tablePath(jt) },
+        joinType: JOIN_TYPE[j.strategy || 'left-join'] || 'left-outer',
+        columns: on,
+        name: jt.name.toUpperCase(),
       });
     }
     const element: SigmaElement = {
       id: sigmaShortId(), kind: 'table', name: card.name || `Card ${card.id}`,
-      source: { kind: 'join', connectionId, joins },
+      // source.name is the formula prefix for the head source's columns.
+      source: { kind: 'join', name: baseT.name.toUpperCase(), connectionId, joins },
       columns: [], order: [],
     };
     const ctx = newCtx(element, true);
@@ -497,7 +521,14 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
       }
       return;
     }
-    const ctrl: any = { id: sigmaShortId(), kind: 'control', controlId, name, controlType, value: value ?? null };
+    // Each controlType variant has REQUIRED discriminant fields (live-verified: omitting
+    // text's `mode` fails the union match and surfaces as `Invalid kind: "control"`).
+    const ctrl: any = { id: sigmaShortId(), kind: 'control', controlId, name, controlType };
+    if (controlType === 'text') ctrl.mode = 'equals';
+    if (controlType === 'number') ctrl.mode = '=';
+    if (controlType === 'date') ctrl.mode = '=';
+    if (controlType === 'switch') ctrl.mode = 'True/All';
+    if (value != null) ctrl.value = value;
     controlByControlId.set(controlId, ctrl);
     controlElements.push(ctrl);
   };
@@ -530,7 +561,9 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
         const fieldId = Array.isArray(dim) && dim[0] === 'field' && typeof dim[1] === 'number' ? dim[1] : null;
         const f = fieldId != null ? fidx?.byId.get(fieldId) : undefined;
         const colDesc = f ? `[${f.displayName}] (${f.tableName})` : `the tag's mapped column (field ${fieldId ?? '?'} — resolve via GET /api/field/{id})`;
-        sql = sql.replace(TAG_RE(tagName), `1=1 /* Metabase field filter {{${tagName}}} → filter ${f ? `[${f.displayName}]` : 'the mapped column'} on the consuming Sigma element */`);
+        // NO {{braces}} in the comment — Sigma resolves {{…}} refs even inside SQL
+        // comments and 400s on the missing control (live-verified).
+        sql = sql.replace(TAG_RE(tagName), `1=1 /* Metabase field filter '${tagName}' → filter ${f ? `[${f.displayName}]` : 'the mapped column'} on the consuming Sigma element */`);
         warnings.push(`card "${card.name}": native {{${tagName}}} is a FIELD FILTER (widget ${tag['widget-type'] || '?'}) on ${colDesc} — the predicate was neutralized to 1=1 in the SQL; recreate it as a Sigma control + element filter on that column in the workbook (field filters expand to a whole WHERE clause, not a scalar).`);
       } else if (ttype === 'card') {
         // {{#N}} sub-question — inline its SQL when the referenced card is available
@@ -580,7 +613,10 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
       for (const rm of card.result_metadata || []) {
         const disp = rm.display_name || sigmaDisplayName(rm.name);
         const id = sigmaShortId();
-        ctx.columns.push({ id, formula: `[${disp}]` });   // bare display-name refs (contract)
+        // sql-element column refs MUST be [Custom SQL/ALIAS] (raw SQL output alias).
+        // Bare [Display Name] refs POST 200 but resolve to type "error" at query
+        // time (live-verified — the readback gate exists for exactly this).
+        ctx.columns.push({ id, name: disp, formula: `[Custom SQL/${rm.name || disp}]` });
         ctx.order.push(id);
         ctx.colIdByName.set(disp.toLowerCase(), id);
       }
@@ -636,6 +672,9 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
       const unit = Array.isArray(b) && b[2]?.['temporal-unit'];
       if (unit) addCalc(target, `${ctxM.fieldDisplay(b)} (${titleCase(String(unit))})`, ctxM.resolveField(b));
       else if (Array.isArray(b) && b[2]?.binning) ctxM.resolveField(b); // emits the binning warning
+      // implicit FK breakout ([field, dim, {source-field}]) — resolveField ensures the
+      // dim TABLE element exists, so the FK relationship + derived-view column survive
+      else if (Array.isArray(b) && b[2]?.['source-field']) ctxM.resolveField(b);
     }
     // aggregations → element metrics
     for (const a of q.aggregation || []) {

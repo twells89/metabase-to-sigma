@@ -1,13 +1,14 @@
 # Design notes — Metabase → Sigma
 
-## Status: built from public docs, NOT yet live-validated
+## Status: LIVE-VALIDATED end to end (2026-06-11)
 
-This plugin was authored from the public Metabase API/MBQL documentation and the
-proven structure of its sibling converters (cognos/qlik/quicksight/…). Every
-sibling was hardened by live parity testing; **this one has not had that pass
-yet**. Treat the fixture-driven tests as shape checks, not proof. The
-first live engagement should follow the validation loop in the repo README
-(Docker Metabase → point at the Sigma-connected warehouse → migrate → parity).
+Full pipeline proven against a local Metabase **v0.61.3** (jar, OpenJDK) connected
+to the same Snowflake warehouse as Sigma: 8 pilot cards + a 2-tab parameterized
+dashboard → discovery → converter → DM POST (readback clean) → workbook POST
+(readback clean) → **EXACT MCP-query parity** on every element (KPI total, 4
+regions, 3 channels, 30 months, 15 category×channel cells, pivot cells, filtered
+row counts). See §10 for the live-verified contracts that replaced the old
+"known unknowns" and the validation-loop recipe.
 
 ## What maps to what
 
@@ -69,27 +70,53 @@ first live engagement should follow the validation loop in the repo README
    user-attributes after the DM is posted — same opt-in/out gate as every
    sibling skill (never silent, never slow).
 
-## Known unknowns to verify on first live run
+## Live-verified contracts (was "known unknowns" — resolved 2026-06-11, see §10)
 
-- Exact `dashcards` field names on the customer's version (`size_x` vs `sizeX`).
-- Whether `result_metadata` is always populated (cards never run may have none).
-- `pivot_table.column_split` ref format variants (field refs vs column names —
-  both handled, but the split is version-sensitive).
+- **Native SQL column refs**: bare `[Display Name]` POSTs 200 but resolves to
+  type "error" at query time. The contract is `[Custom SQL/RAW_ALIAS]` (raw SQL
+  output alias from `result_metadata.name`) + an explicit column `name`. The
+  readback gate exists for exactly this failure class.
+- **Join-source spec shape** (the manager's `on:[…]` contract was WRONG): each
+  join is `{left, right, joinType, columns:[{left:'[Display Name]', right:…}],
+  name}` — `columns` not `on`; refs are Sigma-PRETTIFIED display names (physical
+  `[PRODUCT_KEY]` → 400 "Column reference not found"); `connectionId` is REQUIRED
+  on each side's nested source; enum is `inner|left-outer|right-outer|full-outer|
+  lookup` (bare `left` → 400). `source.name` + per-join `name` are the formula
+  prefixes (`[NAME/Col]`) for head/right columns.
+- **DM control elements**: each `controlType` variant has REQUIRED discriminant
+  fields (text/number/date need `mode`); omitting them fails the union match and
+  surfaces misleadingly as `Invalid kind: "control"`.
+- **Sigma parses `{{…}}` inside SQL comments** — a neutralized field-filter
+  comment must NOT contain the literal tag braces or the POST 400s on the
+  missing control.
+- **Text elements carry `body`**, not `text`.
+- **100% stacking**: enum is `none|stacked|normalized` — Metabase's `normalized`
+  passes through verbatim ('percent' is rejected).
+- **Cross-document DM references** are `source.kind:'data-model'` (kind 'table'
+  is same-workbook only → 400 "Dependency not found").
+- **Display-name casing is AP-style**: first AND last words always capitalize;
+  stopwords lowercase only mid-name (`IS_EMAIL_OPT_IN` → "Is Email Opt In",
+  `DAYS_TO_SHIP` → "Days to Ship"). Cross-element refs are case-SENSITIVE;
+  warehouse-table refs are case-insensitive — so a casing bug only breaks
+  derived views/relationship refs.
+- **Pivot result_metadata carries `field_ref: null`** (v0.61) — refs must be
+  reconstructed from the MBQL by name (agg cols are named sum/count/avg/…);
+  `pivot-grouping` is a Metabase-internal column to skip.
+- **Sigma does NOT honor sql-element names** (all read back "Custom SQL") —
+  remap-wb-to-dm-ids.mjs matches native-card placeholders by column-set
+  fingerprint (smallest unique superset) and REPAIRS every workbook formula ref
+  against the live DM columns ([Element Name/Actual Column Name]).
+
+## Still open
+
+- Exact `dashcards` field names on older self-hosted versions (`size_x` verified on v0.61).
 - Sigma funnel support: if/when a native funnel element verifies end-to-end,
   upgrade `funnel` from flagged→converted.
-- **Native SQL column refs**: emitted as bare `[Display Name]` (the
-  sigma-data-model-manager production rule). Prior qlik live work used
-  `[Custom SQL/ALIAS]` where the SQL emits matching double-quoted aliases — if
-  the first live POST rejects bare refs on a sql element, that prefix is the fix.
-- **Join-source spec shape** `{kind:'join', joins:[{left, right, joinType,
-  on:[{left,right}]}]}` follows the manager's contract; not yet round-tripped
-  through a live POST from this converter.
-- **100% stacking**: `stackable.stack_type:"normalized"` → `stacking:'percent'`
-  with a verify-warning — the exact Sigma enum value is unconfirmed.
 - **Layout application**: the workbook converter emits a 1:1 24-col `layout`
-  HINT block (element ids change on POST, so pre-baked layout XML would break);
-  `scripts/apply-layout.mjs` currently computes its own per-kind heights — add
-  an exact-grid mode that consumes the hints to preserve the Metabase geometry.
+  HINT block; `scripts/apply-layout.mjs` currently computes its own per-kind
+  heights — add an exact-grid mode that consumes the hints.
+- Conditional formatting: `single` rules pass through; `range` (gradient) rules
+  are still flagged (Sigma backgroundScale shape not yet live-verified).
 
 ## 9. First production contact (2026-06, Metabase Cloud v1.61.4 — 7,023 cards / 1,548 dashboards)
 
@@ -125,3 +152,39 @@ elements emitted from template tags (`text`/`number`/`date`/`switch`
 controlTypes) and `conditionalFormats` built from `table.column_formatting`
 are doc-derived — verify on the first live Sigma POST; no end-to-end
 Metabase→Sigma parity migration has been run yet.
+
+## 10. First live Sigma validation (2026-06-11, local Metabase v0.61.3 → tj-wells-1989)
+
+The repeatable validation loop, no Docker required:
+
+1. `brew install openjdk` + the Metabase jar (match the customer's major version;
+   Java 24+ needs `--sun-misc-unsafe-memory-access=allow --add-opens=java.base/java.nio=ALL-UNNAMED`
+   or the Snowflake JDBC driver's Arrow reader throws `ExceptionInInitializerError`).
+2. Headless setup: `GET /api/session/properties` → `setup-token` → `POST /api/setup`.
+3. Snowflake connection via key-pair: details `{use-password:false,
+   private-key-options:'local', private-key-path:…}` — same warehouse Sigma reads,
+   so native SQL migrates verbatim and parity is apples-to-apples.
+4. Author pilot cards via `POST /api/card` mirroring the estate's dominant
+   patterns (native SQL, template tags incl. field filters + `[[optional]]`,
+   MBQL agg/breakout, explicit join, implicit FK breakout, scalar/pie/stacked-bar/
+   pivot/cond-format displays), one 2-tab dashboard with `parameter_mappings`.
+5. Execute every card (`POST /api/card/{id}/query`) and SAVE the rows — this is
+   the parity baseline AND proves the card-results extraction path customers'
+   scoped keys may lack (Eucalyptus's key 403'd ALL THREE execution surfaces:
+   card query, `/query/json` export, ad-hoc `/api/dataset` — plan engagements
+   accordingly: parity needs either query perms or warehouse access).
+6. Skill loop: discover → convert → post-and-readback (DM) → convert dashboard
+   → remap (now also repairs refs) → post-and-readback (workbook) → MCP query
+   each element vs the step-5 baseline.
+
+Result: EXACT parity on all 8 cards (total 110,788.35; 633 filtered rows; all
+dimension splits). OSS v0.61 serves pMBQL with `legacy_query: null` — the
+pmbql-normalize path is mandatory, not a Cloud quirk.
+
+Found-and-fixed during the gauntlet (each was a live 400 or an error-typed
+column): join-source shape ×4, control `mode`, `{{tag}}`-in-comment, sql-element
+`[Custom SQL/…]` refs, text `body`, `stacking:normalized`, `data-model` source
+kind, AP-style last-word casing, pivot `field_ref:null`, implicit-FK dim-table
+ensure, explicit-join cards sourcing their card-named element. Plus two script
+bugs any first run would hit: six scripts committed without exec bits, and
+`metabase-discover.sh` f-string escapes that crash python ≤3.11.
