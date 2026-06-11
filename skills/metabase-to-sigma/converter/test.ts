@@ -295,6 +295,34 @@ const nativeCard = read('top-customers-native.card.json');
     els.some((e) => e.kind === 'text' && /## Ops Notes/.test((e as any).body)));
 }
 
+// ── BigQuery estate: paths/casing/dialect (Sigma side LIVE-verified 2026-06-11
+// against conn bc534032 "BigQuery- Wells"; Metabase side fixture-shaped) ────────
+{
+  const bq = read('bq-estate.card.json');
+  // NO --database flag: project must come from metadata.details['project-id'].
+  const r = convertMetabaseToSigma(bq, { connectionId: 'connBQ' });
+  const els = r.model.pages[0].elements as any[];
+  const orders = els.find((e) => e.name === 'Data Order');
+  const customers = els.find((e) => e.name === 'Dim Customer');
+  const joinEl = els.find((e) => e.name === 'Revenue by Region (BQ join)');
+  const sqlEl = els.find((e) => e.source?.kind === 'sql');
+
+  check('bq', 'project auto-derived from details.project-id, case-preserved lowercase table tail',
+    JSON.stringify(orders?.source?.path) === JSON.stringify(['acme-data-lake', 'dbt_prod', 'data_order']));
+  check('bq', 'per-table dataset wins (estate spans datasets — no global --schema)',
+    JSON.stringify(customers?.source?.path) === JSON.stringify(['acme-data-lake', 'dbt_core', 'dim_customer']));
+  check('bq', 'warehouse column prefix matches the lowercase path tail',
+    orders?.columns?.some((c: any) => c.formula === '[data_order/Order Id]'));
+  check('bq', 'BQ-dialect native SQL verbatim (backticks + trailing comma preserved)',
+    /`acme-data-lake\.dbt_prod\.data_order`/.test(sqlEl?.source?.statement || '')
+    && /as n_orders,\s*from/.test(sqlEl?.source?.statement || ''));
+  check('bq', 'join source/relationship names case-preserved + prettified condition refs',
+    joinEl?.source?.name === 'data_order'
+    && joinEl?.source?.joins?.[0]?.name === 'dim_customer'
+    && joinEl?.source?.joins?.[0]?.columns?.[0]?.left === '[Customer Id]'
+    && orders?.relationships?.some((x: any) => x.name === 'dim_customer'));
+}
+
 // ── the two pmbql-normalize.mjs copies must stay byte-identical ──────────────
 {
   const here = dirname(fileURLToPath(import.meta.url));
@@ -307,7 +335,11 @@ const nativeCard = read('top-customers-native.card.json');
 for (const f of readdirSync(FIX).sort()) {
   try {
     if (f.endsWith('.card.json')) {
-      const r = convertMetabaseToSigma({ metadata, cards: [read(f)] }, { connectionId: 'c', database: 'CSA', schema: 'TJ' });
+      const j = read(f);
+      // self-contained bundles ({metadata, cards}) carry their own engine metadata
+      const r = j.cards
+        ? convertMetabaseToSigma(j, { connectionId: 'c' })
+        : convertMetabaseToSigma({ metadata, cards: [j] }, { connectionId: 'c', database: 'CSA', schema: 'TJ' });
       // a lone flagged card (e.g. multi-stage) may legitimately produce 0 elements — but never silently
       if (!r.model.pages[0].elements.length && !r.warnings.length) throw new Error('no elements and no warnings');
       console.log(`✓ ${f.padEnd(36)} cards → ${r.stats.elements} elems · ${r.stats.columns} cols · ${r.stats.metrics} metrics · ${r.stats.relationships} rels (${r.warnings.length} warnings)`);

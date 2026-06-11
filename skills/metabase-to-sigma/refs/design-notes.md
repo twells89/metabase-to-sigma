@@ -207,3 +207,28 @@ Two converter fixes from this round:
 - **`card__N` dashcards whose parent is NOT on the dashboard** now source the
   card's OWN DM element by card name (a `card__N` placeholder 400s at POST);
   passing `cardNameById` still routes to the parent model instead.
+
+### §10c BigQuery readiness (Sigma side LIVE-verified; Metabase side fixture-shaped)
+
+Same-warehouse BQ migrations need no new machinery — the differences are all
+encoded and tested (`fixtures/bq-estate.card.json` + the `bq:` test block):
+
+- **Paths are `[project, dataset, table]`**, case-preserved (BQ is case-sensitive,
+  typically lowercase). The converter no longer uppercases table names anywhere —
+  a no-op for Snowflake (whose metadata is already uppercase), required for BQ.
+- **Project auto-derives** from `metadata.details['project-id']` when `--database`
+  is omitted (Snowflake: `details.db`). **Per-table `schema` from metadata wins**
+  over `--schema` — real estates span datasets.
+- **Live-verified against a real BQ connection** (no Metabase-on-BQ needed — the
+  Sigma side is what the converter POSTs): warehouse-table element with lowercase
+  path + `[table_tail/Prettified Col]` refs, a join with lowercase source/join
+  names + prettified `[Display Name]` condition refs, and a **verbatim BQ-dialect
+  sql element (backticks + trailing comma)** all POST clean, read back 0 errors,
+  and return correct rows. Cross-project tables (`bigquery-public-data.*`) appear
+  in Sigma's catalog the same way.
+- **First live Metabase-on-BQ run, verify only**: that `/api/database/{id}/metadata`
+  `details` exposes `project-id` on the customer's auth flavor, and dataset-level
+  `schema` population. Everything Sigma-side is already proven.
+- **Cross-warehouse** (Metabase-on-BQ → Sigma-on-Snowflake) remains the one real
+  gap: the 91%-native-SQL estate would need a transpile pass before passthrough —
+  flag, don't fake.

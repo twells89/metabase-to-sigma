@@ -1,5 +1,5 @@
 /**
- * Metabase → Sigma Data Model converter.   [built from public docs — NOT yet live-validated]
+ * Metabase → Sigma Data Model converter.   [LIVE-VALIDATED 2026-06-11 — exact parity; see refs/design-notes.md §10]
  *
  * Input = plain REST JSON (see refs/rest-api.md):
  *   { metadata?: <GET /api/database/{id}/metadata>, cards: [<GET /api/card/{id}>, …],
@@ -321,6 +321,19 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
   const fidx = inp.metadata ? buildFieldIndex(inp.metadata) : null;
   if (!fidx) warnings.push("no database metadata provided — falling back to each card's result_metadata names (table qualifiers are lost); pass GET /api/database/{id}/metadata as input.metadata.");
 
+  // Engine-aware database default when --database is omitted: Metabase metadata
+  // carries the warehouse identifier in engine-specific `details` keys
+  // (Snowflake `db`; BigQuery `project-id` — Sigma BQ paths are [project, dataset, table]).
+  const metaEngine: string = inp.metadata?.engine || '';
+  const metaDb: string = (() => {
+    const d = inp.metadata?.details || {};
+    const keys = /bigquery/.test(metaEngine)
+      ? ['project-id', 'project-id-from-credentials']
+      : ['db', 'dbname', 'database'];
+    for (const k of keys) if (typeof d[k] === 'string' && d[k]) return d[k];
+    return '';
+  })();
+
   interface ElemCtx {
     element: SigmaElement; columns: SigmaColumn[]; metrics: SigmaMetric[]; order: string[];
     colIdByName: Map<string, string>; colIdByFieldId: Map<number, string>;
@@ -337,10 +350,16 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
   };
 
   const tablePath = (t: MetabaseTableInfo): string[] => {
-    const path: string[] = [database || '<DATABASE>'];
-    const sch = schema || t.schema || '';
+    const path: string[] = [database || metaDb || '<DATABASE>'];
+    // Per-table schema FIRST — estates span schemas/datasets; --schema is only a
+    // fallback for metadata that omits it.
+    const sch = t.schema || schema || '';
     if (sch) path.push(sch);
-    path.push(t.name.toUpperCase());
+    // Preserve case: Snowflake metadata reports uppercase physical names already;
+    // BigQuery (case-sensitive) reports lowercase — uppercasing breaks BQ paths
+    // AND the formula prefixes that must match the path tail (live-verified:
+    // [accounts/Account Id] on path […, 'accounts'] resolves; ACCOUNTS would not).
+    path.push(t.name);
     return path;
   };
 
@@ -350,7 +369,9 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
     if (existing) return existing;
     const t = fidx?.tableById.get(tableId);
     if (!t) { warnings.push(`table ${tableId} is not in the database metadata — cannot emit a warehouse-table element for it.`); return null; }
-    const tableTail = t.name.toUpperCase();
+    // Case-preserved: the warehouse-element column prefix must match the path tail
+    // exactly (BQ is lowercase; Snowflake metadata is already uppercase).
+    const tableTail = t.name;
     const element: SigmaElement = {
       id: sigmaShortId(), kind: 'table', name: sigmaDisplayName(t.name),
       source: { connectionId, kind: 'warehouse-table', path: tablePath(t) },
@@ -456,13 +477,13 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
         right: { kind: 'warehouse-table', connectionId, path: tablePath(jt) },
         joinType: JOIN_TYPE[j.strategy || 'left-join'] || 'left-outer',
         columns: on,
-        name: jt.name.toUpperCase(),
+        name: jt.name,
       });
     }
     const element: SigmaElement = {
       id: sigmaShortId(), kind: 'table', name: card.name || `Card ${card.id}`,
       // source.name is the formula prefix for the head source's columns.
-      source: { kind: 'join', name: baseT.name.toUpperCase(), connectionId, joins },
+      source: { kind: 'join', name: baseT.name, connectionId, joins },
       columns: [], order: [],
     };
     const ctx = newCtx(element, true);
@@ -471,7 +492,7 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
         const key = f.displayName.toLowerCase();
         if (ctx.colIdByName.has(key)) continue; // duplicate display name (e.g. the join key on both sides) — first wins
         const id = sigmaInodeId(f.columnName);
-        ctx.columns.push({ id, formula: sigmaColFormula(t.name.toUpperCase(), f.columnName) });
+        ctx.columns.push({ id, formula: sigmaColFormula(t.name, f.columnName) });
         ctx.order.push(id);
         ctx.colIdByName.set(key, id);
         ctx.colIdByFieldId.set(f.id, id);
@@ -730,7 +751,7 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
       if (!sourceColumnId || !targetColumnId) continue;
       (ctx.element.relationships ||= []).push({
         id: sigmaShortId(),
-        name: tgtField.tableName.toUpperCase(),   // relationship name = target table path tail, uppercase
+        name: tgtField.tableName,   // relationship name = target table tail, case-preserved
         targetElementId: tgtCtx.element.id,
         keys: [{ sourceColumnId, targetColumnId }],
       });
