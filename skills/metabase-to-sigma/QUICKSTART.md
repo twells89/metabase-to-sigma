@@ -20,10 +20,11 @@ API, translate MBQL to Sigma formulas, build a Sigma data model and matching wor
 and **verify data parity** against the same warehouse.
 
 negative
-: **Validation status:** these skills were built from the public Metabase docs and are
-pending their first live-validated migration. The phase gates (POST + readback,
-parity check) are designed so nothing silently wrong ships — trust the gates, not
-the draft.
+: **Validation status:** discovery, extraction, and scoring are production-validated
+against a live 7k-card Metabase Cloud estate (v1.61.4, 100% modern pMBQL format);
+the conversion BUILD path (POST to Sigma) is still fixture-validated — no
+end-to-end parity migration yet. The phase gates (POST + readback, parity check)
+are designed so nothing silently wrong ships — trust the gates, not the draft.
 
 positive
 : Metabase is open source — you can rehearse the entire migration on a local

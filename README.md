@@ -7,14 +7,20 @@ converters (Tableau, Power BI, Qlik, ThoughtSpot, QuickSight, Looker, Cognos).
 Built standalone so it can graduate into that marketplace's `plugins/` once
 live-validated.
 
-## ⚠ Status: built from public docs — not yet live-validated
+## Status: discovery / extraction / scoring production-validated — conversion build path fixture-validated
 
-Everything here was authored from the public Metabase REST API / MBQL
-documentation and the proven structure of the sibling converters. The converter
-passes its fixture test suite, but **no live Metabase instance has been run
-against it yet**. Until the validation loop below has been completed at least
-once, treat the output as a strong first draft: post it, read it back, verify
-parity — the skill's own hard gates assume nothing.
+The READ side has now survived first production contact: discovery, extraction,
+and coverage scoring were **validated against a live 7k-card / 1.5k-dashboard
+Metabase Cloud estate (v1.61.4)** — which is where the pMBQL normalizer, the
+bulk-endpoint discovery fast path (>1hr → ~1min), the template-tag → control
+mapping, and the field-id fallback chain all come from (see
+`skills/metabase-to-sigma/refs/design-notes.md` §9).
+
+**Honesty ledger:** the conversion BUILD path (POST data model + workbook to
+Sigma) is still fixture-validated only — **no end-to-end Metabase→Sigma parity
+migration has been run yet**. Until the loop below has completed once, treat
+converter output as a strong first draft: post it, read it back, verify parity
+— the skill's own hard gates assume nothing.
 
 **The self-serve validation loop (no vendor gating — Metabase is OSS):**
 
@@ -33,7 +39,7 @@ docker run -d -p 3000:3000 --name metabase metabase/metabase
 | Skill | What it does |
 |---|---|
 | [`skills/metabase-to-sigma`](skills/metabase-to-sigma/SKILL.md) | The converter: MBQL questions/models → Sigma data model; dashboards → Sigma workbooks. Phased (Discover → Convert → DM-reuse check → POST+readback gate → workbook wiring → parity gate), with RLS (sandboxing) port flow and a gap-scout loop for unmapped expressions. |
-| [`skills/metabase-assessment`](skills/metabase-assessment/SKILL.md) | Read-only estate inventory + migration-readiness readout: walks collections via REST, scores every card/dashboard against the converter's exact coverage (auto/hint/manual/unhandled), renders a branded HTML report with an effort/wave plan. |
+| [`skills/metabase-assessment`](skills/metabase-assessment/SKILL.md) | Read-only estate inventory + migration-readiness readout: bulk-fetches every card/dashboard definition via REST (7k-card estate in ~1 minute), scores each against the converter's exact coverage (auto/hint/manual/unhandled), renders a branded HTML report with an effort/wave plan. |
 
 ## Quick start
 
@@ -57,15 +63,17 @@ to Sigma"* / *"assess my Metabase estate."*
 
 The conversion surface is specified in `skills/metabase-to-sigma/refs/`:
 
-- `rest-api.md` — endpoints, auth, version gotchas (`dashcards` vs `ordered_cards`, …)
-- `mbql-shapes.md` — card/dashboard JSON + MBQL structures the converter parses
+- `rest-api.md` — endpoints (incl. the bulk fast path), auth (`x-api-key`), version gotchas (`dashcards` vs `ordered_cards`, …)
+- `mbql-shapes.md` — card/dashboard JSON + MBQL structures the converter parses, incl. the **pMBQL** ("lib/") format modern instances actually return
 - `expression-dsl.md` — the MBQL-op → Sigma-formula mapping table (translated vs flagged)
-- `design-notes.md` — architecture decisions + known unknowns to verify live
+- `template-tags.md` — native `{{tags}}` → Sigma controls (Sigma custom SQL uses the same `{{}}` syntax)
+- `design-notes.md` — architecture decisions + §9 first-production-contact findings + the honesty ledger of still-unverified Sigma POST shapes
 
 Core principle (shared with every sibling): **flag, never fake.** Anything
 without a clean Sigma analog (cum-sum/offset windows, segment refs,
-funnel/gauge/progress/waterfall viz, click behaviors) is surfaced as a loud
-warning with a readable placeholder — never silently wrong numbers.
+funnel/gauge/progress/waterfall/sankey viz, object detail views, multi-stage
+queries, click behaviors) is surfaced as a loud warning with a readable
+placeholder — never silently wrong numbers.
 
 ## License
 

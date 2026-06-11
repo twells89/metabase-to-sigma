@@ -110,26 +110,32 @@ the file directory.
 bash scripts/discover-metabase.sh --out /tmp/metabase-assessment-<env>
 # include per-user personal collections too (skipped by default):
 bash scripts/discover-metabase.sh --out /tmp/metabase-assessment-<env> --include-personal
+# useful caps / knobs: --concurrency 16  --max-dashboards N  --skip-cards  --walk
 ```
 
-`discover-metabase.sh` lists the collection tree (`GET /api/collection`), then
-walks every collection's items
-(`GET /api/collection/{id}/items?models=card&models=dashboard&models=dataset`,
-paginated), and fetches the full definition of every leaf so the scorer can run
-offline afterward:
+`discover-metabase.sh` uses the **bulk fast path** (production-validated: a
+7,023-card / 1,548-dashboard Metabase Cloud estate in ~1 minute — the old
+per-item walk took >1 hour on the same estate):
 
-- card / model → `GET /api/card/{id}` → `<out>/specs/<id>.card.json`
-- dashboard → `GET /api/dashboard/{id}` → `<out>/specs/<id>.dashboard.json`
-- each **referenced database**, once → `GET /api/database/{id}/metadata`
-  → `<out>/metadata/<db>.metadata.json` (the integer-field-id → column map the
-  converter requires)
+1. `GET /api/collection` → collection names + personal flags
+2. **`GET /api/card`** — EVERY card with its full definition in ONE response
+   (~110MB for 7k cards), streamed to disk and split locally by
+   `scripts/mb-bulk-split.py` → `<out>/specs/<id>.card.json`
+3. `GET /api/dashboard` (shallow list) + **parallel** `GET /api/dashboard/{id}`
+   (default 16 concurrent, resumable) → `<out>/specs/<id>.dashboard.json`
+4. each **referenced database**, once → `GET /api/database/{id}/metadata`
+   → `<out>/metadata/<db>.metadata.json` (the integer-field-id → column map the
+   converter requires). A **403 on a scoped key is recorded, not fatal** —
+   field resolution falls back to card `result_metadata`, then
+   `GET /api/field/{id}` (works even for restricted DBs).
 
 It emits `<out>/inventory.json` =
 `{ environment: {...counts}, artifacts: [ {id,type,name,collection,view_count,specFile} ] }`.
 
 Notes baked into the script:
-- **Pagination** — follows `limit`/`offset` on collection items; default page
-  size 100.
+- **Fallback walk** — `--walk` (or automatically when bulk `GET /api/card`
+  isn't available) uses the old paginated per-collection item walk; default
+  page size 100.
 - **Personal collections** — skipped by default (`personal_owner_id != null`);
   `--include-personal` overrides. Personal sandboxes are usually retire-not-
   migrate content and they dominate raw counts.
@@ -166,10 +172,10 @@ recorded with a count **and** the specific reason + remediation.
 
 | Bucket | Signal | Why |
 |---|---|---|
-| `auto` | MBQL table source, breakouts, translated aggregations (`count/sum/avg/min/max/median/distinct/stddev/var/percentile/count-where/sum-where/share`), translated expression & filter ops (arithmetic, `case`, `coalesce`, string fns, date fns, comparison/`between`/`time-interval`…); native-SQL cards (→ DM `sql` element) with plain `text`/`number`/`date` template tags; displays `table/bar/row/line/area/combo/scatter/pie/scalar/smartscalar/pivot/map` | translated cleanly by the converter |
-| `hint` | nested-card source (`source-table: "card__N"`); `dimension`-type **field-filter** template tags; explicit MBQL `joins` | convert fine, but review (source ordering, control wiring, join fan-out) |
-| `manual` | `binning` opts on a breakout (numeric histogram); `["segment", id]` / legacy `["metric", id]` refs (definitions live in other objects — inline needed); `click_behavior`; `snippet` template tags | converter passes through + warns; brief re-creation in Sigma |
-| `unhandled` | `cum-sum` / `cum-count` / `offset` aggregations (window scope lives on the consuming element); displays `funnel/gauge/progress/waterfall`; sandboxing policies (EE); any unmapped MBQL op | converter emits a flagged placeholder + loud warning |
+| `auto` | MBQL table source, breakouts, translated aggregations (`count/sum/avg/min/max/median/distinct/stddev/var/percentile/count-where/sum-where/share`), translated expression & filter ops (arithmetic, `case`, `coalesce`, string fns, date fns, casts, `in`/`not-in`, comparison/`between`/`time-interval`…); native-SQL cards (→ DM `sql` element) with plain `text`/`number`/`date`/`boolean` template tags (same `{{}}` syntax in Sigma); single-rule conditional formatting; displays `table/bar/row/line/area/combo/scatter/pie/scalar/smartscalar/pivot/map` | translated cleanly by the converter (pMBQL is normalized at intake) |
+| `hint` | nested-card source (`source-table: "card__N"`); `dimension`-type **field-filter** template tags; `{{#card}}` tags; optional `[[…]]` SQL blocks; explicit MBQL `joins` | convert fine, but review (source ordering, control wiring, join fan-out) |
+| `manual` | `binning` opts on a breakout (numeric histogram); `["segment", id]` / legacy `["metric", id]` refs (definitions live in other objects — inline needed); `click_behavior`; `snippet` template tags; gradient/range conditional formatting; `object` detail views; multi-stage queries | converter passes through + warns; brief re-creation in Sigma |
+| `unhandled` | `cum-sum` / `cum-count` / `offset` aggregations (window scope lives on the consuming element); displays `funnel/gauge/progress/waterfall/sankey`; sandboxing policies (EE); any unmapped MBQL op | converter emits a flagged placeholder + loud warning |
 
 ### Dashboard signals
 
@@ -177,7 +183,7 @@ recorded with a count **and** the specific reason + remediation.
 |---|---|---|
 | `auto` | dashcards whose card `display` is supported (24-col grid maps 1:1 to Sigma); text/heading virtual cards (markdown passes through); `parameters` → Sigma controls; `tabs` → workbook pages | converter emits clean elements |
 | `manual` | `click_behavior` on a dashcard (cross-filter / drill link) | re-implement as a Sigma action |
-| `unhandled` | dashcards whose card `display` is `funnel/gauge/progress/waterfall` | data preserved as a flagged table; re-pick the closest Sigma element |
+| `unhandled` | dashcards whose card `display` is `funnel/gauge/progress/waterfall/sankey` | data preserved as a flagged table; re-pick the closest Sigma element |
 
 ### Output
 
@@ -255,8 +261,10 @@ re-discovery.
 
 | Script | Purpose |
 |---|---|
-| `scripts/discover-metabase.sh` | Walk the collection tree via `/api`, fetch every card/dashboard definition + per-database schema metadata, emit `inventory.json`. Auth via `MB_KEY` (x-api-key) or `MB_SESSION`. Read-only, paginated, resumable, token-expiry aware, skips personal collections by default. |
-| `scripts/score-coverage.mjs` | Classify every card/dashboard auto/hint/manual/unhandled against the converter's exact gap signals by walking the MBQL JSON trees; per-artifact complexity + estate roll-up. Zero-dependency (Node built-ins only). |
+| `scripts/discover-metabase.sh` | Bulk fast path: `GET /api/card` (all definitions in one response, split locally) + `GET /api/dashboard` list + parallel per-dashboard GETs + per-database schema metadata, emit `inventory.json`. Production-validated: 7k-card estate in ~1 minute. Auth via `MB_KEY` (x-api-key) or `MB_SESSION`. Read-only, resumable, token-expiry aware, skips personal collections by default; `--walk` = legacy per-collection walk. |
+| `scripts/mb-bulk-split.py` | Local companion (stdlib-only): splits the bulk card payload into per-card specs, builds artifact records + `databases.txt`, filters dashboard fetch lists (resumable). Never talks to the network. |
+| `scripts/pmbql-normalize.mjs` | pMBQL ("lib/" MBQL) → legacy MBQL normalizer (byte-identical copy of the converter's — the converter test suite guards the sync). |
+| `scripts/score-coverage.mjs` | Classify every card/dashboard auto/hint/manual/unhandled against the converter's exact gap signals by walking the (normalized) MBQL JSON trees; per-artifact complexity + estate roll-up. Production-validated on 8,571 artifacts. |
 | `scripts/render-report.mjs` | Emit the branded standalone `readout.html`. Zero-dependency. |
 
 ## Refs

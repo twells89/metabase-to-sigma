@@ -46,8 +46,13 @@ count, the reason, and the remediation shown in the readout.
 | `["metric", id]` ref (legacy) | manual | definition lives in another object | inline the metric's aggregation (`GET /api/legacy-metric/{id}`) |
 | `click_behavior` (top-level or per-column) | manual | cross-filter / drill link | re-implement as a Sigma action |
 | snippet template tag (`type: snippet`) | manual | splices a shared SQL snippet | inline the snippet text into the Custom SQL |
+| optional `[[…]]` SQL block | hint | Metabase includes it only when the tag has a value; Sigma has no optional-clause syntax | field-filter/default-carrying blocks stay active; others are dropped (Metabase's empty-value behavior) with a loud warning — review each |
+| conditional formatting — `single` rule | auto | threshold rule → Sigma `conditionalFormats` entry | — |
+| conditional formatting — gradient/`range` scale | manual | backgroundScale spec shape not live-verified | recreate in the Sigma UI |
+| `object` display (record detail) | manual | single-record detail view | flagged table; recreate detail with element filters / drill |
+| multi-stage query (pMBQL `stages`>1 / `source-query`) | manual | a sub-query, not a flat card | rebuild as chained Sigma elements; converter flags + skips |
 | `cum-sum` / `cum-count` / `offset` | unhandled | running-total / lag window — the window scope lives on the consuming element | rebuild with `CumulativeSum` / `Lag` in the date-grouped workbook element (proven pattern); converter emits a flagged placeholder |
-| display `funnel/gauge/progress/waterfall` | unhandled | no native Sigma element | data preserved as a flagged table; re-pick the closest element (ordered bar for funnel, KPI for gauge/progress) |
+| display `funnel/gauge/progress/waterfall/sankey` | unhandled | no native Sigma element | data preserved as a flagged table; re-pick the closest element (ordered bar for funnel, KPI for gauge/progress) |
 | unmapped MBQL op | unhandled | no confirmed Sigma mapping | translate by hand; converter emits `/* unmapped: <op> */` + a loud warning |
 | sandboxing policy (EE, from `sandboxes.json`) | unhandled | GTAP row-level security per group | port to Sigma user attributes + DM filters via the shared RLS engine (`apply_sigma_rls.py`) — opt-in, reviewed per policy |
 
@@ -65,13 +70,35 @@ count, the reason, and the remediation shown in the readout.
 Both `dashcards[]` (v48+, `size_x/size_y`) and legacy `ordered_cards[]`
 (`sizeX/sizeY`) shapes are accepted.
 
+## Production calibration (a 7k-card production estate, 2026-06)
+
+First production run of this scorer — Metabase Cloud v1.61.4, 7,023 cards /
+12 models / 1,548 dashboards (8,571 artifacts), 100% pMBQL. Results to sanity-
+check your own runs against:
+
+- **97% auto-migratable** (50,806 features: 45,303 auto · 4,152 hint ·
+  894 manual · 457 unhandled)
+- tags: **migrate-first 8,039 · easy-win 272 · needs-review 183 · moderate 77**
+- display histogram (cards): table 2999 · bar 1604 · line 1176 · combo 449 ·
+  scalar 259 · pie 135 · row 130 · funnel 83 · area 67 · pivot 39 · object 37 ·
+  waterfall 15 · sankey 13 · gauge 11 · scatter 3 · progress 3 — everything
+  except funnel/waterfall/sankey/gauge/progress (flagged tables) and object
+  (flagged detail) converts natively
+- top gaps: funnel display (353 incl. dashcards) · gradient conditional
+  formatting (594) · object detail (273) · gauge (40) · waterfall (29) ·
+  sankey (21) · multi-stage (16) · `month-name`/`day-name` (7)
+- 45% of cards carry template tags; 53% of dashboards carry parameters; 17%
+  use tabs; `view_count` available (usage-based value path exercised)
+
 ## Calibrating against the bundled fixtures
 
-Running against `fixtures/` (3 cards + 1 dashboard) must produce all four buckets:
+Running against `fixtures/` (4 cards + 2 dashboards) must produce all four buckets:
 
 - **Revenue by Month** (101) — all-auto MBQL (sum/count, month breakout, multi-value `=` filter, line) → `migrate-first`, low.
 - **Cumulative Revenue** (102) — `cum-sum` → `needs-review`, high (the `-` Profit expression still scores auto).
 - **Orders Cleaned (model)** (103) — native SQL model; `{{status}}` text tag auto, `{{date_range}}` dimension field filter → 1 **hint**; `migrate-first`, low.
 - **Executive Overview** (201) — funnel dashcard → **unhandled**; a `click_behavior` → **manual**; parameter/tab/line/text → auto; `view_count: 240` exercises the usage-based value path.
+- **Filtered Revenue (pMBQL Native + Tags)** (104) — modern `lib/type` format: plain tags auto, field-filter + card tags + optional block → **hints**; `migrate-first`.
+- **Regional Ops (pMBQL)** (202) — pMBQL dashboard: parameters auto, object dashcard → **manual**.
 
 If those don't show up, the scorer regressed.

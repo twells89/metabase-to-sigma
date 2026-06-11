@@ -6,6 +6,11 @@ so `converter/metabase.ts` (`translateMbqlExpr`) walks a tree — no regex DSL
 parsing. The custom-expression *text* a user typed (`[Price] - [Cost]`) is never
 stored; only the MBQL tree is.
 
+Modern instances emit **pMBQL** clauses (`[op, {opts}, …args]` — opts second);
+`pmbql-normalize.mjs` rewrites them to the legacy shapes below at intake, so
+every row in this table is expressed in legacy clause order. See
+`mbql-shapes.md` § pMBQL.
+
 ## Translated (automatic)
 
 | MBQL op | Sigma | Notes |
@@ -24,6 +29,9 @@ stored; only the MBQL tree is.
 | `["regex-match-first", s, pat]` | `RegexpExtract(s, pat)` | |
 | `["split-part", s, delim, n]` | `SplitPart(s, delim, n)` | |
 | `["round"/"floor"/"ceil"/"abs"/"sqrt"/"exp", x]` | `Round/Floor/Ceiling/Abs/Sqrt/Exp(x)` | |
+| `["text", x]` / `["float", x]` / `["integer", x]` | `Text(x)` / `Number(x)` / `Int(x)` | v50+ casts |
+| `["date", x]` | `DateTrunc("day", x)` | date(x) = day-truncated datetime |
+| `["in"/"not-in", f, a, b, …]` | `Or(f = a, f = b, …)` / `And(f != a, …)` | pMBQL multi-value ops (also appear in server `legacy_query`) |
 | `["power", x, y]` | `Power(x, y)` | |
 | `["log", x]` | `Log(x, 10)` | Metabase `log` is base-10 |
 | `["datetime-add", d, n, "unit"]` | `DateAdd("unit", n, d)` | unit string passes through |
@@ -64,6 +72,8 @@ stored; only the MBQL tree is.
 | `["segment", id]` | saved-segment ref — definition lives in another object | inline the segment's own MBQL (discovery fetches `/api/segment/{id}`; auto-inline is a roadmap item) |
 | `["metric", id]` (legacy) | saved-metric ref | same — inline from `/api/legacy-metric/{id}` |
 | `binning` opts on a breakout | numeric histogram buckets | recreate with `BinFixed`/`BinCount` in the workbook element |
+| `["day-name"/"month-name"/"quarter-name", x]` | localized name lookup — no confirmed Sigma fn | rebuild with a `case`/If chain or a Sigma Text format (observed 10× on a 7k-card estate) |
+| multi-stage query (pMBQL `stages` > 1 / legacy `source-query`) | a sub-query, not an expression | rebuild as chained Sigma elements; converter flags + skips (14 of 7,023 observed) |
 | native `{{tag}}` of type `dimension` ("field filter") | expands to a whole WHERE clause at runtime | becomes a Sigma control on the target column + element filter; plain `text`/`number`/`date` tags → `=`-parameter controls (converted) |
 | `click_behavior` | cross-filter / drill links | Sigma actions — manual follow-up |
 | `smartscalar`/`trend` comparison | auto previous-period delta | KPI value converts; add a Sigma comparison manually |

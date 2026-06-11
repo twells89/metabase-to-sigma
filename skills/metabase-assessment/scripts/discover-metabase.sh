@@ -10,27 +10,47 @@
 # Usage:
 #   discover-metabase.sh --probe
 #       Cheap check — GET /api/session/properties, prints the instance version.
-#   discover-metabase.sh --out <dir> [--include-personal] [--page N]
-#       Walk every collection (via the flat /api/collection list), page through
-#       its items (cards, models, dashboards), fetch each definition into
-#       <dir>/specs/, fetch schema metadata once per referenced database into
-#       <dir>/metadata/, emit <dir>/inventory.json.
+#   discover-metabase.sh --out <dir> [--include-personal] [--concurrency N]
+#                        [--max-dashboards N] [--skip-cards] [--walk] [--page N]
+#       FAST PATH (default — production-validated on a 7k-card / 1.5k-dashboard
+#       estate, ~1 minute vs >1 hour for the old per-item walk):
+#         1. GET /api/card        — ALL card definitions in ONE response
+#                                   (~110MB for 7k cards; streamed to disk, then
+#                                   split locally by mb-bulk-split.py)
+#         2. GET /api/dashboard   — the dashboard list, then PARALLEL
+#                                   per-dashboard GETs (default 16 concurrent,
+#                                   resumable: on-disk specs are skipped)
+#         3. GET /api/database/{id}/metadata once per referenced database
+#            (403 on scoped keys is recorded, not fatal — the converter falls
+#             back to card result_metadata, then GET /api/field/{id})
+#       --walk forces the legacy per-collection item walk (also the automatic
+#       fallback when the bulk card endpoint is unavailable).
 #
 # READ-ONLY: only ever issues GETs. Never POSTs / modifies / runs anything.
-# Paginated, resumable (already-downloaded specs are skipped), 401-aware
-# (writes token_expired:true into inventory.json and exits gracefully).
+# Resumable (already-downloaded specs are skipped), 401-aware (writes
+# token_expired:true into inventory.json and exits gracefully).
 # Personal collections are skipped by default (--include-personal to override).
 set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 
 OUT=""
 PROBE=0
 PAGE=100
 INCLUDE_PERSONAL=0
+CONC=16
+MAX_DASH=""
+SKIP_CARDS=0
+WALK=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --probe) PROBE=1; shift ;;
     --out)   OUT="$2"; shift 2 ;;
     --page)  PAGE="$2"; shift 2 ;;
+    --concurrency) CONC="$2"; shift 2 ;;
+    --max-dashboards) MAX_DASH="$2"; shift 2 ;;
+    --skip-cards) SKIP_CARDS=1; shift ;;
+    --walk) WALK=1; shift ;;
     --include-personal) INCLUDE_PERSONAL=1; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -87,12 +107,14 @@ fi
 [ -n "$OUT" ] || { echo "--out <dir> required (unless --probe)" >&2; exit 2; }
 mkdir -p "$OUT/specs" "$OUT/metadata"
 ART="$OUT/.artifacts.jsonl"; : > "$ART"
+PFLAG=""
+[ "$INCLUDE_PERSONAL" = "1" ] && PFLAG="--include-personal"
 
 # instance version (best effort, for the inventory header)
 req "/api/session/properties"
 VERSION=$(jq -r '.version.tag // "unknown"' "$RESP" 2>/dev/null || echo "unknown")
 
-# ---- collection list (flat) ----
+# ---- collection list (flat — needed by both paths for names + personal flags) ----
 req "/api/collection?archived=false"
 if ! ok; then
   jq -n --arg base "$MB_BASE" --arg code "${HTTP_CODE:-?}" \
@@ -101,16 +123,16 @@ if ! ok; then
   echo "AUTH FAILED (HTTP ${HTTP_CODE:-?}) listing collections — wrote token_expired flag; re-auth (MB_SESSION expired? MB_KEY group lacks perms?) and re-run." >&2
   exit 0
 fi
+cp "$RESP" "$OUT/collections.json"
+N_COLLECTIONS=$(jq 'length' "$OUT/collections.json" 2>/dev/null || echo 0)
 
-# id + name per collection; skip personal collections unless asked.
-# The flat list includes the "root" pseudo-collection on most versions; ensure it.
+# id + name per collection (legacy walk); skip personal collections unless asked.
 COLL_TSV=$(jq -r --argjson p "$INCLUDE_PERSONAL" '
   [ .[] | select($p == 1 or ((.personal_owner_id // null) == null and ((.is_personal // false) | not))) ]
-  | .[] | "\(.id)\t\(.name)"' "$RESP" 2>/dev/null || true)
+  | .[] | "\(.id)\t\(.name)"' "$OUT/collections.json" 2>/dev/null || true)
 if ! printf '%s\n' "$COLL_TSV" | cut -f1 | grep -qx 'root'; then
   COLL_TSV=$(printf 'root\tOur analytics\n%s' "$COLL_TSV")
 fi
-N_COLLECTIONS=$(printf '%s\n' "$COLL_TSV" | grep -c . || true)
 
 fetched_dbs=""  # space-separated db ids already fetched
 
@@ -122,7 +144,14 @@ fetch_metadata() { # $1 = database id
   f="$OUT/metadata/$db.metadata.json"
   [ -s "$f" ] && return 0
   req "/api/database/$db/metadata"
-  if ok && [ -s "$RESP" ]; then cp "$RESP" "$f"; fi
+  if ok && [ -s "$RESP" ]; then
+    cp "$RESP" "$f"
+  elif [ "$HTTP_CODE" = "403" ]; then
+    # Scoped keys often can't read whole-database metadata. NOT fatal: the
+    # converter resolves field ids via card result_metadata, then
+    # GET /api/field/{id} (which works even for restricted DBs), then SQL names.
+    echo "database $db: metadata HTTP 403 — use the field-id fallback chain (result_metadata → GET /api/field/{id})" >> "$OUT/metadata/unavailable.txt"
+  fi
 }
 
 record_failed() { # $1=id $2=type $3=name $4=collection — definition fetch failed
@@ -130,7 +159,7 @@ record_failed() { # $1=id $2=type $3=name $4=collection — definition fetch fai
     '{id:($id|tonumber? // $id),type:$type,name:$name,collection:$coll,specFile:null}' >> "$ART"
 }
 
-fetch_card() { # $1=id $2=name $3=collection — appends an artifact record
+fetch_card() { # $1=id $2=name $3=collection — appends an artifact record (legacy walk)
   local id="$1" name="$2" coll="$3" f="$OUT/specs/$1.card.json" db
   if [ ! -s "$f" ]; then
     req "/api/card/$id"
@@ -138,7 +167,6 @@ fetch_card() { # $1=id $2=name $3=collection — appends an artifact record
     if ! ok || [ ! -s "$RESP" ]; then record_failed "$id" "card" "$name" "$coll"; return 0; fi
     cp "$RESP" "$f"
   fi
-  # db metadata (once per referenced database) + type/view_count from the spec on disk
   db=$(jq -r '.database_id // .dataset_query.database // empty' "$f" 2>/dev/null || true)
   fetch_metadata "$db"
   jq -c --arg coll "$coll" --arg sf "specs/$id.card.json" '
@@ -147,7 +175,7 @@ fetch_card() { # $1=id $2=name $3=collection — appends an artifact record
     record_failed "$id" "card" "$name" "$coll"
 }
 
-fetch_dashboard() { # $1=id $2=name $3=collection
+fetch_dashboard() { # $1=id $2=name $3=collection (legacy walk)
   local id="$1" name="$2" coll="$3" f="$OUT/specs/$1.dashboard.json"
   if [ ! -s "$f" ]; then
     req "/api/dashboard/$id"
@@ -160,32 +188,102 @@ fetch_dashboard() { # $1=id $2=name $3=collection
     "$f" >> "$ART" 2>/dev/null || record_failed "$id" "dashboard" "$name" "$coll"
 }
 
-# ---- walk every collection's items (paginated) ----
-while IFS=$'\t' read -r cid cname; do
-  [ -n "$cid" ] || continue
-  [ "$TOKEN_EXPIRED" = "1" ] && break
-  offset=0
-  while :; do
+# ============================================================================
+# FAST PATH (default): bulk card endpoint + parallel dashboard GETs
+# ============================================================================
+if [ "$WALK" = "0" ]; then
+  # ---- cards: one bulk GET, split locally ----
+  if [ "$SKIP_CARDS" = "0" ]; then
+    if ls "$OUT/specs/"*.card.json >/dev/null 2>&1 && [ -s "$OUT/databases.txt" ]; then
+      echo "cards already split on disk — rebuilding artifact records (re-delete specs/ to force a re-fetch)"
+      python3 "$SCRIPT_DIR/mb-bulk-split.py" collect-cards --collections "$OUT/collections.json" --out "$OUT" $PFLAG
+    else
+      echo "bulk-fetching ALL card definitions (GET /api/card — ~15MB per 1k cards, streamed to disk) …"
+      BULK="$OUT/cards.bulk.json"
+      CODE=$(curl -s -o "$BULK" -w '%{http_code}' "$MB_BASE/api/card" \
+        -H 'Accept: application/json' -H "$AUTH_NAME: $AUTH_VALUE" || echo "000")
+      if [ "$CODE" = "200" ] && [ -s "$BULK" ]; then
+        python3 "$SCRIPT_DIR/mb-bulk-split.py" split-cards --bulk "$BULK" --collections "$OUT/collections.json" --out "$OUT" $PFLAG
+        rm -f "$BULK"
+      elif [ "$CODE" = "401" ]; then
+        TOKEN_EXPIRED=1
+      else
+        echo "bulk GET /api/card failed (HTTP $CODE) — falling back to the legacy per-collection walk." >&2
+        WALK=1
+      fi
+    fi
+  fi
+
+  # ---- dashboards: list once, fetch in parallel (resumable) ----
+  if [ "$WALK" = "0" ] && [ "$TOKEN_EXPIRED" = "0" ]; then
+    req "/api/dashboard"
+    if ok; then
+      cp "$RESP" "$OUT/dashboards.list.json"
+      DIDS="$OUT/.dash_ids"
+      python3 "$SCRIPT_DIR/mb-bulk-split.py" list-dashboards --list "$OUT/dashboards.list.json" \
+        --collections "$OUT/collections.json" --out "$OUT" $PFLAG ${MAX_DASH:+--max "$MAX_DASH"} > "$DIDS"
+      N_TO_FETCH=$(grep -c . "$DIDS" || true)
+      if [ "${N_TO_FETCH:-0}" -gt 0 ]; then
+        echo "fetching $N_TO_FETCH dashboards ($CONC parallel, resumable) …"
+        export MB_BASE AUTH_NAME AUTH_VALUE OUT
+        xargs -P "$CONC" -n 1 sh -c '
+          id="$0"; f="$OUT/specs/$id.dashboard.json"
+          [ -s "$f" ] && exit 0
+          tmp="$f.tmp.$$"
+          code=$(curl -s -o "$tmp" -w "%{http_code}" "$MB_BASE/api/dashboard/$id" \
+            -H "Accept: application/json" -H "$AUTH_NAME: $AUTH_VALUE" || echo 000)
+          if [ "$code" = "200" ] && [ -s "$tmp" ]; then mv "$tmp" "$f"
+          else rm -f "$tmp"; echo "dashboard $id: HTTP $code" >&2; fi
+        ' < "$DIDS" || true
+      fi
+      python3 "$SCRIPT_DIR/mb-bulk-split.py" collect-dashboards --collections "$OUT/collections.json" --out "$OUT"
+      rm -f "$DIDS"
+    elif [ "$HTTP_CODE" = "401" ]; then
+      TOKEN_EXPIRED=1
+    else
+      echo "GET /api/dashboard failed (HTTP $HTTP_CODE) — dashboards via the legacy walk." >&2
+      WALK=1
+    fi
+  fi
+
+  # ---- database metadata (once per referenced database; 403 = fallback chain) ----
+  if [ "$TOKEN_EXPIRED" = "0" ] && [ -s "$OUT/databases.txt" ]; then
+    while IFS= read -r db; do
+      [ -n "$db" ] && fetch_metadata "$db"
+    done < "$OUT/databases.txt"
+  fi
+fi
+
+# ============================================================================
+# LEGACY WALK (--walk, or automatic fallback): per-collection item pages
+# ============================================================================
+if [ "$WALK" = "1" ]; then
+  while IFS=$'\t' read -r cid cname; do
+    [ -n "$cid" ] || continue
     [ "$TOKEN_EXPIRED" = "1" ] && break
-    req "/api/collection/$cid/items?models=card&models=dashboard&models=dataset&limit=$PAGE&offset=$offset"
-    [ "$TOKEN_EXPIRED" = "1" ] && break
-    ok || break
-    n=$(jq '.data | length' "$RESP" 2>/dev/null || echo 0)
-    [ "$n" -gt 0 ] 2>/dev/null || break
-    # snapshot the page before inner reqs reuse $RESP
-    items=$(jq -r '.data[] | "\(.model)\t\(.id)\t\(.name)"' "$RESP")
-    while IFS=$'\t' read -r model iid iname; do
-      [ -n "$iid" ] || continue
+    offset=0
+    while :; do
       [ "$TOKEN_EXPIRED" = "1" ] && break
-      case "$model" in
-        card|dataset) fetch_card "$iid" "$iname" "$cname" ;;
-        dashboard)    fetch_dashboard "$iid" "$iname" "$cname" ;;
-      esac
-    done <<< "$items"
-    [ "$n" -lt "$PAGE" ] && break
-    offset=$((offset + PAGE))
-  done
-done <<< "$COLL_TSV"
+      req "/api/collection/$cid/items?models=card&models=dashboard&models=dataset&limit=$PAGE&offset=$offset"
+      [ "$TOKEN_EXPIRED" = "1" ] && break
+      ok || break
+      n=$(jq '.data | length' "$RESP" 2>/dev/null || echo 0)
+      [ "$n" -gt 0 ] 2>/dev/null || break
+      # snapshot the page before inner reqs reuse $RESP
+      items=$(jq -r '.data[] | "\(.model)\t\(.id)\t\(.name)"' "$RESP")
+      while IFS=$'\t' read -r model iid iname; do
+        [ -n "$iid" ] || continue
+        [ "$TOKEN_EXPIRED" = "1" ] && break
+        case "$model" in
+          card|dataset) fetch_card "$iid" "$iname" "$cname" ;;
+          dashboard)    fetch_dashboard "$iid" "$iname" "$cname" ;;
+        esac
+      done <<< "$items"
+      [ "$n" -lt "$PAGE" ] && break
+      offset=$((offset + PAGE))
+    done
+  done <<< "$COLL_TSV"
+fi
 
 # ---- sandboxing probe (Pro/EE only; 404 on OSS is fine) ----
 if [ "$TOKEN_EXPIRED" = "0" ]; then

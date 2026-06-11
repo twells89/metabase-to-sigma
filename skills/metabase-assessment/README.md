@@ -10,19 +10,27 @@ gap, and render a branded HTML readout.
 SKILL.md                      phased workflow (Connect → Discover → Score → Effort → Render)
 PRIVACY.md                    customer-facing data-handling disclosure
 scripts/
-  discover-metabase.sh        walk /api collections, fetch card/dashboard defs + db metadata, emit inventory.json (read-only)
+  discover-metabase.sh        bulk fast path: GET /api/card (one response) + parallel dashboard GETs + db metadata → inventory.json (read-only; --walk = legacy per-collection walk)
+  mb-bulk-split.py            local splitter for the bulk card payload (stdlib-only, never networks)
+  pmbql-normalize.mjs         pMBQL ("lib/" MBQL) → legacy normalizer (synced copy of the converter's)
   score-coverage.mjs          classify auto/hint/manual/unhandled vs. converter gaps; per-artifact + roll-up (zero-dep)
   render-report.mjs           branded standalone readout.html (zero-dep)
 refs/
-  mb-rest.md                  endpoints + the two auth shapes used
-  scoring-rubric.md           every gap signal → bucket → remediation
+  mb-rest.md                  endpoints + the two auth shapes used + the fast path
+  scoring-rubric.md           every gap signal → bucket → remediation + production calibration (7k-card estate)
   usage-telemetry.md          honest take on Metabase usage stats (view_count v50+ is thin; rich audit is Pro/EE)
 fixtures/
   101.card.json               all-auto MBQL question
   102.card.json               cum-sum question (unhandled)
   103.card.json               native-SQL model with a field-filter tag (hint)
+  104.card.json               pMBQL (modern "lib/" format) native question with every tag kind
   201.dashboard.json          funnel dashcard (unhandled) + click behavior (manual) + view_count
+  202.dashboard.json          pMBQL dashboard: tag-targeting parameters + object detail card
 ```
+
+Discovery + scoring are **production-validated**: a 7,023-card / 1,548-dashboard
+Metabase Cloud estate (v1.61.4, 100% pMBQL) discovered in ~1 minute and scored
+97% auto-migratable. See `refs/scoring-rubric.md` § Production calibration.
 
 ## Quick start (offline, against the bundled fixtures)
 

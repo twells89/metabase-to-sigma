@@ -28,6 +28,9 @@ import {
   inferSigmaFormat, buildDerivedElements,
   type SigmaElement, type SigmaColumn, type SigmaMetric, type ConversionResult,
 } from './sigma-ids.js';
+// pMBQL ("lib/" MBQL) → legacy MBQL — modern instances (Cloud v1.61+) return
+// dataset_query as {"lib/type":"mbql/query","stages":[…]}; normalize at intake.
+import { normalizeCard } from './pmbql-normalize.mjs';
 
 // ── options / shared types ────────────────────────────────────────────────────
 
@@ -174,13 +177,21 @@ export function translateMbqlExpr(node: any, ctx: MbqlCtx): string {
     case 'relative-datetime':
       return node[1] === 'current' ? 'Today()' : `DateAdd("${node[2]}", ${t(node[1])}, Today())`;
 
+    // type casts (Metabase 50+ expression functions)
+    case 'text': return `Text(${t(node[1])})`;
+    case 'integer': return `Int(${t(node[1])})`;
+    case 'float': return `Number(${t(node[1])})`;
+    case 'date': return `DateTrunc("day", ${t(node[1])})`;   // date(x) = day-truncated datetime
+
     // comparisons — multi-value `=` ⇒ Or chain (Sigma has NO IsIn); multi `!=` ⇒ And chain
-    case '=': case '!=': {
+    // (pMBQL `in`/`not-in` are normalized to multi-value =/!= upstream; aliased here too)
+    case 'in': case 'not-in': case '=': case '!=': {
+      const eq = op === '=' || op === 'in' ? '=' : '!=';
       const a = t(node[1]);
       const vals = node.slice(2).map(t);
-      if (vals.length <= 1) return `${a} ${op} ${vals[0] ?? 'Null'}`;
-      const parts = vals.map((v: string) => `${a} ${op} ${v}`);
-      return op === '=' ? `Or(${parts.join(', ')})` : `And(${parts.join(', ')})`;
+      if (vals.length <= 1) return `${a} ${eq} ${vals[0] ?? 'Null'}`;
+      const parts = vals.map((v: string) => `${a} ${eq} ${v}`);
+      return eq === '=' ? `Or(${parts.join(', ')})` : `And(${parts.join(', ')})`;
     }
     case '<': case '<=': case '>': case '>=':
       return `${t(node[1])} ${op} ${t(node[2])}`;
@@ -293,9 +304,11 @@ const titleCase = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s
 
 function normalizeInput(input: any): { metadata?: any; cards: any[]; sandboxes?: any[] } {
   const root = typeof input === 'string' ? JSON.parse(input) : input;
-  if (Array.isArray(root)) return { cards: root };
-  if (root?.cards) return { metadata: root.metadata, cards: root.cards, sandboxes: root.sandboxes };
-  if (root?.dataset_query) return { cards: [root] };
+  // pMBQL → legacy at extraction intake; per-card sniff (a list may mix formats).
+  const norm = (cs: any[]) => (cs || []).map((c) => normalizeCard(c));
+  if (Array.isArray(root)) return { cards: norm(root) };
+  if (root?.cards) return { metadata: root.metadata, cards: norm(root.cards), sandboxes: root.sandboxes };
+  if (root?.dataset_query) return { cards: norm([root]) };
   return { metadata: root?.metadata, cards: [], sandboxes: root?.sandboxes };
 }
 
@@ -369,7 +382,7 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
         if (f) return f.displayName;
         const rm = rmById.get(idOrName);
         if (rm) return rm.display_name || sigmaDisplayName(rm.name);
-        warnings.push(`card "${card.name}": field ${idOrName} could not be resolved (no metadata match, no result_metadata match) — emitted [Field ${idOrName}].`);
+        warnings.push(`card "${card.name}": field ${idOrName} could not be resolved (no metadata match, no result_metadata match) — emitted [Field ${idOrName}]. Fallback chain: pass /api/database/{id}/metadata; if that 403s on a scoped key, GET /api/field/${idOrName} works even for restricted DBs.`);
         return `Field ${idOrName}`;
       }
       return sigmaDisplayName(String(idOrName ?? ''));
@@ -466,6 +479,83 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
   const inFlight = new Set<number>();
   let sqlElements = 0;
 
+  // ── template tags → Sigma controls (45% of cards on the reference estate) ────
+  // Plain variable tags keep their {{tag}} verbatim — Sigma custom SQL uses the
+  // SAME {{control-id}} parameter syntax — and get a matching control element.
+  // Field-filter (dimension) tags expand to a whole SQL predicate at runtime, so
+  // the {{tag}} is replaced with a documented `1=1 /* … */` and the filter is
+  // recreated as a control + element filter on the consuming workbook element.
+  // See refs/template-tags.md for the full mapping table.
+  const TAG_CONTROL_TYPE: Record<string, string> = { text: 'text', number: 'number', date: 'date', boolean: 'switch' };
+  const controlElements: SigmaElement[] = [];
+  const controlByControlId = new Map<string, any>();
+  const ensureControl = (controlId: string, name: string, controlType: string, value: any): void => {
+    const existing = controlByControlId.get(controlId);
+    if (existing) {
+      if (existing.controlType !== controlType) {
+        warnings.push(`template tag "${controlId}" appears with conflicting types (${existing.controlType} vs ${controlType}) across cards — one control was emitted with type ${existing.controlType}; review.`);
+      }
+      return;
+    }
+    const ctrl: any = { id: sigmaShortId(), kind: 'control', controlId, name, controlType, value: value ?? null };
+    controlByControlId.set(controlId, ctrl);
+    controlElements.push(ctrl);
+  };
+  const TAG_RE = (tag: string) => new RegExp(`\\{\\{\\s*${tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\}\\}`, 'g');
+
+  /** Rewrite a native statement per its template tags; returns the SQL to emit. */
+  const processNativeSql = (card: any, statement: string, tags: Record<string, any>): string => {
+    let sql = statement;
+    const tagType = (n: string) => String(tags[n]?.type || 'text').toLowerCase();
+    // 1. Optional [[ … ]] blocks (Metabase: included only when the tag has a value).
+    sql = sql.replace(/\[\[([\s\S]*?)\]\]/g, (_m, body: string) => {
+      const inner = [...body.matchAll(/\{\{\s*([^{}\s]+)\s*\}\}/g)].map((m) => m[1]);
+      const keep = inner.length > 0 && inner.every((n) =>
+        tagType(n) === 'dimension' || tags[n]?.default != null);
+      if (keep) {
+        warnings.push(`card "${card.name}": optional [[…]] block kept ACTIVE (its tag${inner.length > 1 ? 's' : ''} {{${inner.join('}}, {{')}}} ${inner.every((n) => tagType(n) === 'dimension') ? 'are field filters that neutralize to 1=1' : 'have defaults'}) — verify the always-on semantics.`);
+        return body;
+      }
+      warnings.push(`card "${card.name}": optional [[…]] block DROPPED (tag has no default — Metabase omits it when empty; Sigma has no optional-clause syntax). Re-add the clause around the control if the filter must be available: ${body.trim().slice(0, 80)}`);
+      return '';
+    });
+    // 2. Per-tag handling.
+    for (const [tagName, tagRaw] of Object.entries(tags)) {
+      const tag: any = tagRaw;
+      const ttype = String(tag?.type || 'text').toLowerCase();
+      const display = tag?.['display-name'] || sigmaDisplayName(tagName);
+      if (ttype === 'dimension') {
+        // field filter — expands to a whole WHERE predicate at runtime
+        const dim = tag.dimension;
+        const fieldId = Array.isArray(dim) && dim[0] === 'field' && typeof dim[1] === 'number' ? dim[1] : null;
+        const f = fieldId != null ? fidx?.byId.get(fieldId) : undefined;
+        const colDesc = f ? `[${f.displayName}] (${f.tableName})` : `the tag's mapped column (field ${fieldId ?? '?'} — resolve via GET /api/field/{id})`;
+        sql = sql.replace(TAG_RE(tagName), `1=1 /* Metabase field filter {{${tagName}}} → filter ${f ? `[${f.displayName}]` : 'the mapped column'} on the consuming Sigma element */`);
+        warnings.push(`card "${card.name}": native {{${tagName}}} is a FIELD FILTER (widget ${tag['widget-type'] || '?'}) on ${colDesc} — the predicate was neutralized to 1=1 in the SQL; recreate it as a Sigma control + element filter on that column in the workbook (field filters expand to a whole WHERE clause, not a scalar).`);
+      } else if (ttype === 'card') {
+        // {{#N}} sub-question — inline its SQL when the referenced card is available
+        const refId = tag['card-id'];
+        const ref = refId != null ? cardById.get(refId) : undefined;
+        const refDq = ref?.dataset_query;
+        const refTags = refDq?.native?.['template-tags'] || {};
+        if (refDq?.type === 'native' && Object.keys(refTags).length === 0) {
+          sql = sql.replace(TAG_RE(tagName), `(\n${refDq.native?.query || ''}\n)`);
+          warnings.push(`card "${card.name}": native {{${tagName}}} (sub-question card ${refId}) was INLINED as a sub-select from card ${refId}'s SQL — verify.`);
+        } else {
+          warnings.push(`card "${card.name}": native {{${tagName}}} references card ${refId ?? '?'} — ${ref ? 'it is not a tag-free native card, so it was NOT inlined automatically' : `fetch GET /api/card/${refId ?? '{id}'}, add it to the input set, and re-run to inline it`}; resolve manually before posting.`);
+        }
+      } else if (ttype === 'snippet') {
+        warnings.push(`card "${card.name}": native {{${tagName}}} splices a SQL snippet — inline it (GET /api/native-query-snippet) into the statement before posting; Sigma has no snippet library.`);
+      } else {
+        // text / number / date / boolean variable — SAME {{name}} syntax in Sigma custom SQL
+        const controlType = TAG_CONTROL_TYPE[ttype] || 'text';
+        ensureControl(tagName, display, controlType, tag?.default);
+        warnings.push(`card "${card.name}": native {{${tagName}}} (${ttype}) — a Sigma ${controlType} control "${display}" (controlId "${tagName}") was emitted; the {{${tagName}}} reference is kept verbatim (Sigma custom SQL uses the same {{control-id}} parameter syntax). Verify the control's default${tag?.required ? ' (tag is REQUIRED — set a default or the element errors until set)' : ''}.`);
+      }
+    }
+    return sql;
+  };
+
   const processCard = (card: any): void => {
     if (!card) return;
     if (card.id != null && cardElemId.has(card.id)) return;
@@ -475,9 +565,11 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
     const dq = card.dataset_query || {};
     const ctxM = mkMbqlCtx(card);
 
-    // ── native SQL card → sql-source element (statement verbatim, NO element name) ──
+    // ── native SQL card → sql-source element (statement near-verbatim, NO element name) ──
+    // SQL dialect passes through to Sigma custom SQL untouched — same-warehouse
+    // migrations (e.g. BigQuery→BigQuery) are near-verbatim.
     if (dq.type === 'native') {
-      const statement = dq.native?.query || '';
+      const statement = processNativeSql(card, dq.native?.query || '', dq.native?.['template-tags'] || {});
       const element: SigmaElement = {
         // No `name` field: Sigma derives the sql element's own identifier.
         id: sigmaShortId(), kind: 'table',
@@ -492,16 +584,6 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
         ctx.order.push(id);
         ctx.colIdByName.set(disp.toLowerCase(), id);
       }
-      for (const [tagName, tagRaw] of Object.entries(dq.native?.['template-tags'] || {})) {
-        const tag: any = tagRaw;
-        if (tag?.type === 'dimension') {
-          warnings.push(`card "${card.name}": native {{${tagName}}} is a FIELD FILTER (widget ${tag['widget-type'] || '?'}) — it expands to a whole WHERE clause at runtime; create a Sigma control on the target column + an element filter, and rewrite the SQL (the tag was left verbatim).`);
-        } else if (tag?.type === 'snippet' || tag?.type === 'card') {
-          warnings.push(`card "${card.name}": native {{${tagName}}} references a ${tag.type} — inline it into the SQL before posting.`);
-        } else {
-          warnings.push(`card "${card.name}": native {{${tagName}}} (${tag?.type}) — create a Sigma ${tag?.type} control named "${tag?.['display-name'] || tagName}" (controlId "${tagName}") and rewrite the SQL to reference it; the statement is emitted verbatim.`);
-        }
-      }
       if (card.id != null) cardElemId.set(card.id, element.id);
       sqlElements++;
       done();
@@ -510,6 +592,13 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
 
     // ── MBQL card ────────────────────────────────────────────────────────────────
     const q = dq.query || {};
+    if (q['source-query']) {
+      // multi-stage query (pMBQL stages>1 / legacy nested source-query) — rare
+      // (14 of 7,023 on the reference estate) and structurally a sub-query;
+      // flagged, never silently mistranslated.
+      warnings.push(`card "${card.name}" is a MULTI-STAGE query (nested source-query) — not auto-converted; rebuild as a chain of Sigma elements (inner stage → element, outer stage → child element) or a custom-SQL element. Card skipped.`);
+      done(); return;
+    }
     const src = q['source-table'];
     let target: ElemCtx | null = null;
 
@@ -604,6 +693,8 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
     elements.push(ctx.element);
   }
   for (const de of buildDerivedElements(elements)) elements.push(de);
+  // template-tag controls last (so {{tag}} refs in sql elements have a target)
+  for (const ctrl of controlElements) elements.push(ctrl);
 
   // ── Metabase sandboxing (EE row security) — DETECT-ONLY, never injected ───────
   const security = (inp.sandboxes || []).map((s: any) => {
@@ -631,6 +722,7 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
     cards: cards.length,
     elements: elements.length,
     sqlElements,
+    controls: controlElements.length,
     columns: elements.reduce((n, e) => n + (e.columns?.length || 0), 0),
     metrics: elements.reduce((n, e) => n + ((e as any).metrics?.length || 0), 0),
     relationships: relationshipCount,

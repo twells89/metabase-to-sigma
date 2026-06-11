@@ -31,6 +31,9 @@
 
 import { resetIds, sigmaShortId, sigmaDisplayName, formatFromMask } from './sigma-ids.js';
 import { buildFieldIndex, translateMbqlExpr, translateAggregation, type FieldIndex, type MbqlCtx, type LearnedRule } from './metabase.js';
+// pMBQL → legacy at intake: embedded dashcard cards AND parameter_mapping
+// targets arrive in pMBQL form on modern instances (Cloud v1.61+).
+import { normalizeCard, normalizeClause } from './pmbql-normalize.mjs';
 
 // ── workbook spec types (minimal) ────────────────────────────────────────────
 interface WbColumn { id: string; name: string; formula: string; format?: Record<string, any>; hidden?: boolean; }
@@ -40,7 +43,7 @@ interface WbControl {
 }
 interface WbElement {
   id: string; kind: string; name?: string; source?: Record<string, any>;
-  columns?: WbColumn[]; order?: string[]; filters?: any[];
+  columns?: WbColumn[]; order?: string[]; filters?: any[]; conditionalFormats?: any[];
   rowsBy?: Array<{ id: string }>; columnsBy?: Array<{ id: string }>; values?: string[];  // pivot
   xAxis?: { columnId: string };                                                          // cartesian charts
   yAxis?: { columnIds: Array<string | Record<string, any>> };
@@ -60,6 +63,11 @@ export interface MetabaseDashboardResult {
   warnings: string[];
   stats: Record<string, number>;
   layout: DashboardLayoutHint;
+  /** dashboard-parameter → native-template-tag wirings (the dominant pattern on
+   *  production estates: the parameter drives a {{tag}} in a card's SQL). The
+   *  DM converter emits the matching {{tag}} control; these record which
+   *  dashboard parameter should drive it. */
+  parameterWiring?: Array<{ parameter: string; slug: string; card: string; tag: string; kind: 'variable' | 'field-filter' }>;
 }
 export interface MetabaseDashboardOptions {
   workbookName?: string;
@@ -88,7 +96,9 @@ const DISPLAY_KIND: Record<string, string> = {
   scalar: 'kpi-chart', smartscalar: 'kpi-chart', trend: 'kpi-chart',
   pivot: 'pivot-table',
 };
-const NO_ANALOG = new Set(['funnel', 'gauge', 'progress', 'waterfall']);
+// No Sigma analog → flagged table, never faked. Production histogram (7k-card
+// estate): funnel 83 · waterfall 15 · sankey 13 · gauge 11 · progress 3.
+const NO_ANALOG = new Set(['funnel', 'gauge', 'progress', 'waterfall', 'sankey']);
 const titleCase = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
 
 export function convertMetabaseDashboardToSigma(dashboard: any, options: MetabaseDashboardOptions = {}): MetabaseDashboardResult {
@@ -102,7 +112,7 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
   const rawDcs: any[] = dash.dashcards || dash.ordered_cards || [];
   const dcs = rawDcs.map((d: any) => ({
     raw: d,
-    card: d.card,
+    card: d.card ? normalizeCard(d.card) : d.card,
     cardId: d.card_id,
     vs: { ...(d.card?.visualization_settings || {}), ...(d.visualization_settings || {}) },
     tabId: d.dashboard_tab_id ?? null,
@@ -191,17 +201,51 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
     return '<element>';
   };
 
-  // column_settings → Sigma format (number_style/decimals/suffix; mask → formatFromMask)
+  // column_settings → Sigma format (number_style/decimals/currency/prefix/suffix)
+  const CURRENCY_SYMBOL: Record<string, string> = { USD: '$', EUR: '€', GBP: '£', JPY: '¥', CAD: '$', AUD: '$' };
   const formatFromColumnSettings = (s: any): Record<string, any> | undefined => {
     if (!s) return undefined;
     const d = s.decimals ?? 2;
-    let mask: string | null = null;
-    if (s.number_style === 'currency') mask = `$#,##0${d ? '.' + '0'.repeat(d) : ''}`;
-    else if (s.number_style === 'percent') mask = `0${d ? '.' + '0'.repeat(d) : ''}%`;
-    else if (s.number_style === 'decimal' || s.decimals != null) mask = `#,##0${d ? '.' + '0'.repeat(d) : ''}`;
-    let fmt = mask ? formatFromMask(mask) : null;
+    let fmt: Record<string, any> | null = null;
+    if (s.number_style === 'currency' || s.currency) {
+      const sym = CURRENCY_SYMBOL[String(s.currency || 'USD').toUpperCase()] || '$';
+      fmt = { kind: 'number', formatString: `${sym},.${s.decimals ?? 2}f`, currencySymbol: sym };
+    } else if (s.number_style === 'percent') {
+      fmt = formatFromMask(`0${d ? '.' + '0'.repeat(d) : ''}%`);
+    } else if (s.number_style === 'decimal' || s.decimals != null) {
+      fmt = formatFromMask(`#,##0${d ? '.' + '0'.repeat(d) : ''}`);
+    }
     if (s.suffix) fmt = { ...(fmt || { kind: 'number', formatString: ',.2f' }), suffix: s.suffix };
+    if (s.prefix) fmt = { ...(fmt || { kind: 'number', formatString: ',.2f' }), prefix: s.prefix };
+    // date_style / time_style: Sigma date-format spec shape is not yet verified
+    // against a live readback — ignored silently (display-only, data unaffected).
     return fmt || undefined;
+  };
+
+  // table.column_formatting → Sigma conditionalFormats (single rules convert;
+  // range/gradient scales are flagged — backgroundScale spec shape unverified).
+  const CF_OPERATOR: Record<string, string> = {
+    '=': '=', '!=': '!=', '<': '<', '>': '>', '<=': '<=', '>=': '>=',
+    'is-null': 'IsNull', 'not-null': 'IsNotNull', contains: 'Contains',
+    'does-not-contain': 'NotContains', 'starts-with': 'StartsWith', 'ends-with': 'EndsWith',
+  };
+  const buildConditionalFormats = (card: any, rules: any[], byKey: Map<string, string>): any[] => {
+    const out: any[] = [];
+    for (const r of rules || []) {
+      const columnIds = (r.columns || []).map((n: string) => byKey.get(String(n).toLowerCase())).filter(Boolean);
+      if (!columnIds.length) { warnings.push(`card "${card.name}": a conditional-formatting rule targets unresolved column(s) ${JSON.stringify(r.columns)} — skipped.`); continue; }
+      if (r.type === 'single') {
+        const condition = CF_OPERATOR[String(r.operator)];
+        if (!condition) { warnings.push(`card "${card.name}": conditional-formatting operator "${r.operator}" has no Sigma mapping — rule skipped.`); continue; }
+        const cf: any = { type: 'single', columnIds, condition, style: { backgroundColor: r.color || '#509EE3' } };
+        if (r.value !== undefined && condition !== 'IsNull' && condition !== 'IsNotNull') cf.value = r.value;
+        out.push(cf);
+        if (r.highlight_row) warnings.push(`card "${card.name}": a conditional-formatting rule highlights the WHOLE ROW — Sigma's converted rule colors the matched column(s) only; extend columnIds to all columns if row highlighting is required.`);
+      } else {
+        warnings.push(`card "${card.name}": a "${r.type}" (gradient/range) conditional-formatting rule is flagged — recreate as a Sigma backgroundScale conditional format in the UI (spec shape not yet live-verified).`);
+      }
+    }
+    return out;
   };
 
   interface BuiltCols {
@@ -268,6 +312,9 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
     return undefined;
   };
 
+  // dashboard-parameter → template-tag wirings (aggregated; see parameterWiring)
+  const tagWirings: NonNullable<MetabaseDashboardResult['parameterWiring']> = [];
+
   // ── per-dashcard element builder ───────────────────────────────────────────
   const buildElement = (dc: (typeof dcs)[number]): WbElement | null => {
     const vs = dc.vs;
@@ -322,6 +369,11 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
       el.kind = 'table';
       el.name = `${card.name} (was ${display})`;
       warnings.push(`card "${card.name}" is a Metabase ${display} — Sigma has no native ${display} element; emitted its data as a TABLE. Re-pick a Sigma viz in the workbook.`);
+    } else if (display === 'object') {
+      // single-record detail view — flagged, emitted as a table (never faked)
+      el.kind = 'table';
+      el.name = `${card.name} (object detail)`;
+      warnings.push(`card "${card.name}" is a Metabase object DETAIL view (single record) — emitted its data as a flagged TABLE; recreate the detail experience with element filters / drill in Sigma.`);
     } else if (el.kind === 'kpi-chart') {
       const scalarField = vs['scalar.field'] ? built.byKey.get(String(vs['scalar.field']).toLowerCase()) : undefined;
       const valId = scalarField || yIds[0] || built.metricIds[0] || built.order[0];
@@ -398,6 +450,26 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
     }
     // display === 'table' → plain table element: columns + order already set.
 
+    // series_settings → series display names (rename the y columns); colors are
+    // positional-only in the Sigma spec (bar color.scheme) — flagged, not guessed.
+    if (vs.series_settings && el.kind !== 'combo-chart') {
+      let renamed = 0; let colored = 0;
+      for (const [key, s] of Object.entries(vs.series_settings as Record<string, any>)) {
+        const colId = built.byKey.get(String(key).toLowerCase());
+        const c = colId && built.cols.find((c) => c.id === colId);
+        if (c && s?.title && s.title !== c.name) { built.byKey.set(String(s.title).toLowerCase(), c.id); c.name = s.title; renamed++; }
+        if (s?.color) colored++;
+      }
+      if (colored) warnings.push(`card "${card.name}": ${colored} per-series color(s) in series_settings — Sigma's spec colors bar categories positionally (color.scheme) and pie/line series via theme only; re-apply colors in the workbook.`);
+      if (renamed) warnings.push(`card "${card.name}": ${renamed} series renamed from series_settings titles.`);
+    }
+
+    // table.column_formatting → Sigma conditionalFormats (single rules; ranges flagged)
+    if (Array.isArray(vs['table.column_formatting']) && vs['table.column_formatting'].length) {
+      const cfs = buildConditionalFormats(card, vs['table.column_formatting'], built.byKey);
+      if (cfs.length) el.conditionalFormats = cfs;
+    }
+
     // table.columns enabled:false → hide
     for (const tc of vs['table.columns'] || []) {
       if (tc?.enabled === false && tc.name) {
@@ -412,9 +484,42 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
       const p = paramById.get(pm.parameter_id);
       if (!p) { warnings.push(`card "${card.name}": parameter_mapping references unknown parameter ${pm.parameter_id} — skipped.`); continue; }
       const slug = p.slug || p.id;
-      const tgt = pm.target;
+      let tgt = pm.target;
+      // pMBQL targets carry [op, {opts}, …] inner clauses — normalize them.
+      if (Array.isArray(tgt) && tgt.length >= 2) tgt = [tgt[0], normalizeClause(tgt[1])];
+      // native template-tag targets (the DOMINANT production pattern — 13.5k of
+      // 14.6k mappings on the reference estate): the parameter drives a {{tag}}
+      // in the card's SQL. The DM converter emits the {{tag}} control; record
+      // the wiring (aggregated into one warning per parameter, not per mapping).
+      const innerTag = Array.isArray(tgt) && Array.isArray(tgt[1]) && tgt[1][0] === 'template-tag' ? String(tgt[1][1]) : null;
+      if (innerTag && (tgt[0] === 'variable' || tgt[0] === 'dimension')) {
+        if (tgt[0] === 'variable') {
+          tagWirings.push({ parameter: p.name || slug, slug, card: card.name || String(card.id), tag: innerTag, kind: 'variable' });
+          continue;
+        }
+        // dimension + template-tag = the parameter drives a FIELD FILTER tag.
+        // The DM converter neutralized that tag to 1=1 — recreate the filter
+        // here when the tag's mapped column is in the card's result set.
+        tagWirings.push({ parameter: p.name || slug, slug, card: card.name || String(card.id), tag: innerTag, kind: 'field-filter' });
+        const tag = card.dataset_query?.native?.['template-tags']?.[innerTag];
+        const dimRef = tag?.dimension;
+        const dimColId = Array.isArray(dimRef) ? resolveEntry(dimRef, built, ctx) : undefined;
+        if (dimColId) {
+          const targetCol = built.cols.find((c) => c.id === dimColId)!;
+          const boolId = sigmaShortId();
+          built.cols.push({ id: boolId, name: `${targetCol.name} = ${slug}`, formula: `[${targetCol.name}] = [${slug}]`, hidden: true });
+          (el.filters ||= []).push({ id: sigmaShortId(), columnId: boolId, kind: 'list', mode: 'include', values: [true] });
+        } else {
+          warnings.push(`card "${card.name}": parameter "${p.name}" drives field-filter tag {{${innerTag}}} but the tag's column is not in the card's result set — add the column to the SQL SELECT, then filter it via the "${slug}" control.`);
+        }
+        continue;
+      }
+      if (Array.isArray(tgt) && tgt[0] === 'text-tag') {
+        warnings.push(`card "${card.name}": parameter "${p.name}" targets a TEXT TAG (markdown placeholder) — Sigma text elements cannot bind controls; re-author the text or drop the binding.`);
+        continue;
+      }
       if (!Array.isArray(tgt) || tgt[0] !== 'dimension') {
-        warnings.push(`card "${card.name}": parameter "${p.name}" targets ${JSON.stringify(tgt)} (a native variable, not a column) — wire it to the SQL control manually.`);
+        warnings.push(`card "${card.name}": parameter "${p.name}" targets ${JSON.stringify(tgt)} — unmappable; wire it manually.`);
         continue;
       }
       const fieldRef = tgt[1];
@@ -472,6 +577,17 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
     layout.pages.push({ name: pageName, elements: hints });
   }
 
+  // one aggregated warning per parameter that drives native template tags
+  // (per-mapping warnings would be thousands of lines on production estates)
+  if (tagWirings.length) {
+    const bySlug = new Map<string, typeof tagWirings>();
+    for (const w of tagWirings) { (bySlug.get(w.slug) || bySlug.set(w.slug, []).get(w.slug)!).push(w); }
+    for (const [slug, ws] of bySlug) {
+      const tags = [...new Set(ws.map((w) => w.tag))];
+      warnings.push(`parameter "${ws[0].parameter}" (control "${slug}") drives native template tag${tags.length > 1 ? 's' : ''} {{${tags.join('}}, {{')}}} across ${ws.length} card(s) — the DM converter emits the matching {{tag}} control(s); consolidate: either reference the DM control directly or sync this workbook control's value to it (see parameterWiring in the result + refs/template-tags.md).`);
+    }
+  }
+
   const allEls = pages.flatMap((p) => p.elements).filter((e) => e.kind !== 'control');
   const stats = {
     dashcards: dcs.length,
@@ -489,5 +605,6 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
   return {
     workbook: { name, schemaVersion: 1, pages, controls },
     warnings, stats, layout,
+    ...(tagWirings.length ? { parameterWiring: tagWirings } : {}),
   };
 }

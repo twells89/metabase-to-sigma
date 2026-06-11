@@ -17,16 +17,19 @@ Convert Metabase **models + questions** into a Sigma **data model**, then conver
 cleanly; **flag what doesn't** (cum-sum/offset windows, saved segment refs, funnel/gauge
 viz, click behaviors) instead of emitting wrong logic.
 
-> ⚠ **Status: built from public Metabase docs — NOT yet live-validated** (see
-> `refs/design-notes.md` and the repo README). Every shape this skill relies on is
-> documented in `refs/`; on your first live run, diff real API payloads against
-> `refs/mbql-shapes.md` and fix drift there first.
+> **Status: extraction side production-validated** against a live 7k-card / 1.5k-
+> dashboard Metabase Cloud estate (v1.61.4 — 100% pMBQL); the normalizer,
+> template-tag handling, and field-id fallback chain come from that contact
+> (`refs/design-notes.md` §9). **The Sigma BUILD path (POST DM + workbook) is
+> still fixture-validated only — no end-to-end parity migration yet.** On your
+> first live POST, diff real payloads against `refs/` and fix drift there first.
 
 > Read `refs/` before relying on shapes: `design-notes.md` (translation surface +
-> decisions), `rest-api.md` (endpoints + auth + version gotchas), `mbql-shapes.md`
-> (real card/dashboard JSON structures), `expression-dsl.md` (MBQL → Sigma formula
-> mapping table). For canonical Sigma data-model + workbook spec shapes, defer to the
-> companion `sigma-data-models` / `sigma-workbooks` skills.
+> decisions + production findings), `rest-api.md` (endpoints + auth + version
+> gotchas), `mbql-shapes.md` (real card/dashboard JSON structures incl. pMBQL),
+> `expression-dsl.md` (MBQL → Sigma formula mapping table), `template-tags.md`
+> (native {{tags}} → Sigma controls). For canonical Sigma data-model + workbook
+> spec shapes, defer to the companion `sigma-data-models` / `sigma-workbooks` skills.
 
 ---
 
@@ -151,7 +154,12 @@ that matches rows landed since the cache filled is freshness, not a failure.
 
 ## What converts, what's flagged (never faked)
 
-**Converted (per the contract in `refs/expression-dsl.md` — fixture-tested, pending live validation):**
+**Converted (per the contract in `refs/expression-dsl.md` — fixture-tested; extraction
+production-validated, Sigma POST shapes pending first live build):**
+- **pMBQL ("lib/" MBQL)** — the modern wire format (100% of the reference production
+  estate) — normalized to legacy MBQL at intake (`converter/pmbql-normalize.mjs`;
+  the server's `legacy_query` is preferred when present). Multi-stage queries are
+  flagged, never mistranslated.
 - **MBQL questions/models** → DM elements: explicit `joins` → join sources
   (left/right/inner/full), `expressions` → calc columns, `aggregation` → metrics
   (incl. named `aggregation-options`, `count-where`/`sum-where` → `CountIf`/`SumIf`,
@@ -159,22 +167,35 @@ that matches rows landed since the cache filled is freshness, not a failure.
 - **FK metadata → DM relationships** (+ derived join view; the relationship's own key
   column is skipped — a cross-element join-key passthrough compiles to type `error`).
 - **Native SQL questions** → Custom SQL elements (no element name, bare `[Display Name]`
-  refs); plain `{{text/number/date}}` template tags → Sigma controls.
+  refs); the dialect passes through verbatim (same-warehouse migrations — e.g.
+  BigQuery `project.dataset.table` refs — are near-verbatim). Plain
+  `{{text/number/date/boolean}}` template tags keep their `{{tag}}` (Sigma custom SQL
+  uses the SAME syntax) and emit matching controls; **field-filter (dimension) tags**
+  are neutralized to `1=1` + recreated as control + element filter; `{{#card}}` tags
+  are inlined when the referenced card is a tag-free native card in the input set;
+  optional `[[…]]` blocks are kept-active or dropped per Metabase's empty-value
+  semantics (always warned). See `refs/template-tags.md`.
 - **Dashboards** → workbooks: one page per tab, 24-col grid 1:1, scalar/smartscalar →
   KPI (`value: {columnId}`), pivot → pivot-table (`rowsBy`/`columnsBy` `{id}` objects +
   bare-string `values`), `row` display → horizontal bar, maps → region-/point-map,
-  text/heading cards → text elements, parameters → controls + per-card target filters.
-- **Formats**: `column_settings` (currency/decimals/suffix) → Sigma d3 formats first,
-  name/formula heuristics second.
+  text/heading cards → text elements (markdown carries over), parameters → controls +
+  per-card target filters. Parameters that drive native template tags (the DOMINANT
+  production pattern) are recorded in the result's `parameterWiring` + ONE aggregated
+  warning per parameter.
+- **Formats**: `column_settings` (currency incl. symbol, decimals, prefix/suffix) →
+  Sigma d3 formats first, name/formula heuristics second; `series_settings` titles
+  rename series (colors flagged); `table.column_formatting` single threshold rules →
+  `conditionalFormats` (gradient/range scales flagged).
 
 **Flagged with a warning (and a readable placeholder), never faked:**
 `cum-sum`/`cum-count`/`offset` (rebuild with `CumulativeSum`/window calcs in the
 date-grouped consuming element), `["segment", id]` / legacy `["metric", id]` refs
 (inline their MBQL from `/api/segment/{id}` / `/api/legacy-metric/{id}`), binned
-breakouts (→ `BinFixed`/`BinCount`), dimension-type **field-filter** SQL tags,
+breakouts (→ `BinFixed`/`BinCount`), multi-stage queries (→ chained Sigma elements),
 `click_behavior` (→ Sigma actions, manual), smartscalar previous-period comparisons,
-and viz with no native Sigma element: **funnel, gauge, progress, waterfall** → flagged
-table. Unknown MBQL ops emit `/* unmapped: <op> */` + a loud warning.
+`object` detail views (→ flagged detail table), and viz with no native Sigma element:
+**funnel, gauge, progress, waterfall, sankey** → flagged table. Unknown MBQL ops emit
+`/* unmapped: <op> */` + a loud warning.
 
 ## Security: Row-Level Security (sandboxing)
 

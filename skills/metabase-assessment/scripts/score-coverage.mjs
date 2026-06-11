@@ -23,6 +23,10 @@
  */
 import { readFileSync, readdirSync, statSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, basename, dirname } from 'node:path';
+// pMBQL ("lib/" MBQL) → legacy — modern instances (Cloud v1.61+) return
+// dataset_query as {"lib/type":"mbql/query","stages":[…]} (100% of a 7k-card
+// production estate). Normalized at intake; a list may mix both formats.
+import { normalizeCard } from './pmbql-normalize.mjs';
 
 // ---- args ----
 const args = process.argv.slice(2);
@@ -77,7 +81,8 @@ const AUTO_OPS = new Set([
   'get-year', 'get-quarter', 'get-month', 'get-week', 'get-day',
   'get-day-of-week', 'get-hour', 'get-minute', 'get-second',
   'now', 'relative-datetime',
-  '=', '!=', '<', '<=', '>', '>=', 'between',
+  'text', 'integer', 'float', 'date',          // casts → Text/Int/Number/DateTrunc
+  '=', '!=', 'in', 'not-in', '<', '<=', '>', '>=', 'between',
   'is-null', 'not-null', 'is-empty', 'not-empty',
   'starts-with', 'ends-with', 'contains', 'does-not-contain',
   'time-interval', 'inside',
@@ -88,10 +93,14 @@ const IGNORE_OPS = new Set(['field', 'expression', 'aggregation', 'value',
   'aggregation-options', 'and', 'or', 'not', 'asc', 'desc', 'datetime', 'interval']);
 
 // Card displays the converter builds natively (chart/table/pivot/KPI/map).
+// Production histogram (7k-card estate): table 2999 · bar 1604 · line 1176 ·
+// combo 449 · scalar 259 · pie 135 · row 130 · area 67 · pivot 39 · scatter 3
+// all convert natively — see refs/scoring-rubric.md.
 const AUTO_DISPLAYS = new Set(['table', 'bar', 'row', 'line', 'area', 'combo',
   'scatter', 'pie', 'scalar', 'smartscalar', 'trend', 'pivot', 'map']);
-// Displays with no Sigma analog — converter emits a flagged table.
-const UNHANDLED_DISPLAYS = new Set(['funnel', 'gauge', 'progress', 'waterfall']);
+// Displays with no Sigma analog — converter emits a flagged table, never fakes.
+// (production: funnel 83 · waterfall 15 · sankey 13 · gauge 11 · progress 3)
+const UNHANDLED_DISPLAYS = new Set(['funnel', 'gauge', 'progress', 'waterfall', 'sankey']);
 
 function makeAdd(state) {
   return (signal, bucket, reason, remediation) => {
@@ -149,6 +158,12 @@ function walkExpr(node, where, add) {
 // ---- MBQL query (structural pass + expression trees) ----
 function scoreMbqlQuery(q, where, add, deps) {
   if (!q || typeof q !== 'object') return;
+  if (q['source-query']) {
+    // pMBQL stages>1 / legacy nested source-query — converter flags + skips
+    // (rare but real: 14 of 7,023 on the reference production estate)
+    add('multi-stage query (nested source-query)', 'manual', `"${where}" aggregates over an inner query stage`,
+      'Rebuild as a chain of Sigma elements (inner stage → element, outer stage → child element) or a custom-SQL element; the converter flags it, never mistranslates.');
+  }
   const st = q['source-table'];
   if (typeof st === 'string' && st.startsWith('card__')) {
     const dep = Number(st.slice(6));
@@ -189,6 +204,9 @@ function classifyDisplay(display, where, add) {
   const d = String(display || 'table').toLowerCase();
   if (AUTO_DISPLAYS.has(d)) {
     add(`${d} display → Sigma element`, 'auto', `${d} maps to a native Sigma chart/table/pivot/KPI/map element`, '—');
+  } else if (d === 'object') {
+    add('object display (record detail view)', 'manual', `"${where}" is a single-record detail view`,
+      'The converter emits the data as a flagged table; recreate the detail experience with element filters / drill in Sigma.');
   } else if (UNHANDLED_DISPLAYS.has(d)) {
     add(`${d} display (no Sigma analog)`, 'unhandled', `"${where}" renders as a ${d} — no native Sigma element`,
       'Data is preserved as a flagged table; re-pick the closest Sigma element (e.g. ordered bar for funnel, KPI for gauge/progress) in the workbook.');
@@ -217,6 +235,7 @@ function countClickBehaviors(vs) {
 function scoreCard(text, name) {
   let card;
   try { card = JSON.parse(text); } catch { return null; }
+  try { card = normalizeCard(card); } catch { /* score the raw card — never crash the walk */ }
   const type = (card.type === 'model' || card.dataset === true) ? 'model'
     : card.type === 'metric' ? 'metric' : 'card';
   const state = { gaps: [], nAuto: 0, nHint: 0, nManual: 0, nUnhandled: 0 };
@@ -240,14 +259,31 @@ function scoreCard(text, name) {
         add('snippet template tag', 'manual', `tag {{${tname}}} splices a shared SQL snippet`,
           'Inline the snippet text (GET /api/native-query-snippet) into the Sigma Custom SQL by hand; Sigma has no snippet library.');
       } else {
-        add('plain template tag → control (text/number/date)', 'auto', `tag {{${tname}}} (${ttype || 'text'}) maps to a Sigma =-parameter control`, '—');
+        add('plain template tag → control (text/number/date/boolean)', 'auto', `tag {{${tname}}} (${ttype || 'text'}) maps to a Sigma control — Sigma custom SQL uses the SAME {{control-id}} parameter syntax, so the statement converts near-verbatim`, '—');
       }
+    }
+    if (/\[\[/.test(dq.native?.query || '')) {
+      add('optional [[…]] SQL block', 'hint', `"${dispName}" uses Metabase optional-clause syntax`,
+        'Sigma has no optional-clause syntax: blocks whose tags are field filters or have defaults stay active; others are dropped (matching Metabase\'s empty-value behavior) with a loud warning. Review each.');
     }
   } else {
     scoreMbqlQuery(dq.query, dispName, add, deps);
   }
 
   classifyDisplay(card.display, dispName, add);
+
+  // table.column_formatting — single rules convert to Sigma conditionalFormats;
+  // gradient/range scales are flagged (spec shape not yet live-verified).
+  for (const r of card.visualization_settings?.['table.column_formatting'] || []) {
+    if (r?.type === 'single') {
+      add('conditional formatting (single rule) → conditionalFormats', 'auto',
+        `"${dispName}" has a threshold formatting rule — converts to a Sigma conditionalFormats entry`, '—');
+    } else {
+      add('conditional formatting (gradient/range scale)', 'manual',
+        `"${dispName}" has a "${r?.type}" formatting scale`,
+        'Recreate as a Sigma backgroundScale conditional format in the UI; the converter flags it.');
+    }
+  }
 
   const clicks = countClickBehaviors(card.visualization_settings);
   for (let i = 0; i < clicks; i++) {

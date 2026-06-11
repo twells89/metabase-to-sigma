@@ -90,3 +90,38 @@ first live engagement should follow the validation loop in the repo README
   HINT block (element ids change on POST, so pre-baked layout XML would break);
   `scripts/apply-layout.mjs` currently computes its own per-kind heights — add
   an exact-grid mode that consumes the hints to preserve the Metabase geometry.
+
+## 9. First production contact (2026-06, Metabase Cloud v1.61.4 — 7,023 cards / 1,548 dashboards)
+
+Empirical findings folded back into the converter + assessment:
+
+- **pMBQL is the wire format.** 100% of the estate's `dataset_query`s were
+  `{"lib/type":"mbql/query","stages":[…]}`. `pmbql-normalize.mjs` (intake, both
+  skills) converts to the legacy shape; `legacy_query` (server's own
+  down-conversion, a JSON string, present on ~70% of cards) is preferred when
+  parseable. Sniff `lib/type` per card — a list response may mix formats.
+- **Template tags are the dominant feature** (45% of cards): text 5,629 ·
+  date 2,364 · dimension 1,914 · number 1,002 · card 384 · boolean 47; 1,705
+  cards use optional `[[…]]` blocks. See `template-tags.md` for the mapping.
+- **Dashboard parameters target tags, not columns**: 13,474 of 14,600
+  `parameter_mappings` targets were `["variable",["template-tag",…]]`; 1,057
+  `dimension`; 69 `text-tag` (flagged). 53% of dashboards carry parameters;
+  17% use tabs; 6,189 virtual (text/heading) dashcards.
+- **Display histogram** (cards): table 2999 · bar 1604 · line 1176 · combo 449 ·
+  scalar 259 · pie 135 · row 130 · funnel 83 · area 67 · pivot 39 · object 37 ·
+  waterfall 15 · sankey 13 · gauge 11 · scatter 3 · progress 3.
+- **Engines**: BigQuery was the warehouse — `project.dataset.table` refs and
+  trailing-comma SELECTs pass straight through, because the converter emits
+  native SQL **verbatim** into Sigma custom SQL (same-warehouse migrations are
+  near-verbatim; cross-warehouse needs a transpile pass first).
+- **Auth**: API keys send `x-api-key` (NOT a Bearer header). Scoped keys can
+  403 on `/api/database/{id}/metadata`; `GET /api/field/{id}` still worked for
+  restricted DBs — hence the field-resolution fallback chain.
+- **Discovery at scale**: the per-item walk took >1hr; bulk `GET /api/card`
+  (110MB, streamed + split locally) + parallel dashboard GETs ≈ 1 minute.
+
+**Unvalidated remainder (honesty ledger):** Sigma POST shapes for DM `control`
+elements emitted from template tags (`text`/`number`/`date`/`switch`
+controlTypes) and `conditionalFormats` built from `table.column_formatting`
+are doc-derived — verify on the first live Sigma POST; no end-to-end
+Metabase→Sigma parity migration has been run yet.

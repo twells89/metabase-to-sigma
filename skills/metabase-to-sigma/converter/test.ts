@@ -201,12 +201,111 @@ const nativeCard = read('top-customers-native.card.json');
     els.some((e) => e.kind === 'kpi-chart' && !!e.value?.columnId));
 }
 
+// ── pMBQL (modern "lib/" MBQL — 100% of a 7k-card production estate) ─────────
+{
+  const cards = ['pmbql-native', 'pmbql-native-tags', 'pmbql-structured', 'pmbql-joins', 'pmbql-expressions', 'pmbql-multistage']
+    .map((f) => read(`${f}.card.json`));
+  const r = convertMetabaseToSigma({ metadata, cards }, { connectionId: 'c', database: 'CSA', schema: 'TJ' });
+  const els = r.model.pages[0].elements as any[];
+  const sqlEls = els.filter((e) => e.source?.kind === 'sql');
+  const ctrl = (id: string) => els.find((e) => e.kind === 'control' && e.controlId === id);
+  check('pmbql', 'native stages → sql elements (2)', sqlEls.length === 2);
+  const tagged = sqlEls.find((e) => /JOIN CSA.TJ.CUSTOMER_DIM/.test(e.source.statement));
+  check('pmbql', 'plain {{region}} kept verbatim (Sigma uses the same syntax) + text control emitted',
+    /\{\{region\}\}/.test(tagged?.source.statement || '')
+    && ctrl('region')?.controlType === 'text' && ctrl('region')?.value === 'West');
+  check('pmbql', 'number tag → number control with default',
+    ctrl('min_qty')?.controlType === 'number' && ctrl('min_qty')?.value === 1);
+  check('pmbql', 'field-filter tag neutralized to 1=1 + documented comment',
+    /1=1 \/\* Metabase field filter \{\{order_date\}\} → filter \[Order Date\]/.test(tagged?.source.statement || ''));
+  check('pmbql', 'optional [[…]] block without a default DROPPED + warned',
+    !/\{\{tier\}\}/.test(tagged?.source.statement || '') && r.warnings.some((w) => /\[\[…\]\] block DROPPED/.test(w) && /tier/.test(w)));
+  check('pmbql', 'card tag {{#400…}} inlined as a sub-select from the referenced native card',
+    /\(\nSELECT ORDER_DATE, SUM\(SALES_AMOUNT\)/.test(tagged?.source.statement || ''));
+  const of = els.find((e) => e.name === 'Order Fact');
+  check('pmbql', 'named pMBQL aggregation (display-name in opts) → Total Revenue metric',
+    of?.metrics?.some((m: any) => m.name === 'Total Revenue' && m.formula === 'Sum([Sales Amount])')
+    && of?.metrics?.some((m: any) => m.name === 'Count' && m.formula === 'Count()'));
+  check('pmbql', 'opts-second temporal-unit breakout → DateTrunc week calc',
+    of?.columns?.some((c: any) => c.name === 'Order Date (Week)' && c.formula === 'DateTrunc("week", [Order Date])'));
+  check('pmbql', 'filters array AND-merged; pMBQL "in" → Or chain (warned on the shared element)',
+    r.warnings.some((w) => /Or\(\[Order Number\] = 100, \[Order Number\] = 200\)/.test(w))
+    && r.warnings.some((w) => /\[Order Date\] >= DateAdd\("month", -6, Today\(\)\)/.test(w)));
+  const joinEl = els.find((e) => e.name === 'Orders with Customers (pMBQL Join)');
+  check('pmbql', 'pMBQL join {stages, conditions} → join source on Customer Key',
+    joinEl?.source?.kind === 'join' && joinEl?.source?.joins?.[0]?.joinType === 'left'
+    && joinEl?.source?.joins?.[0]?.on?.[0]?.left === 'Customer Key');
+  check('pmbql', 'expression list (lib/expression-name) → calc columns: case→If, date()→DateTrunc day',
+    of?.columns?.some((c: any) => c.name === 'Size Bucket' && c.formula === 'If([Sales Amount] > 1000, "Large", "Small")')
+    && of?.columns?.some((c: any) => c.name === 'Days to Now' && c.formula === 'DateDiff("day", [Order Date], Now())')
+    && of?.columns?.some((c: any) => c.name === 'Order Day' && c.formula === 'DateTrunc("day", [Order Date])'));
+  check('pmbql', 'multi-stage card flagged + skipped (never silently mistranslated)',
+    r.warnings.some((w) => /MULTI-STAGE/.test(w) && /Average Weekly Revenue/.test(w))
+    && !els.some((e) => e.name === 'Average Weekly Revenue (pMBQL Multi-Stage)'));
+}
+
+// ── legacy_query preference (server's own down-conversion wins when present) ──
+{
+  const { normalizeCard } = await import('./pmbql-normalize.mjs');
+  const card = {
+    id: 1, name: 'lq', dataset_query: { 'lib/type': 'mbql/query', database: 2, stages: [{ 'lib/type': 'mbql.stage/native', native: 'SELECT 2' }] },
+    legacy_query: JSON.stringify({ type: 'native', database: 2, native: { query: 'SELECT 1', 'template-tags': {} } }),
+  };
+  const n = normalizeCard(card);
+  check('pmbql', 'legacy_query JSON string preferred over re-normalizing',
+    n.dataset_query.type === 'native' && n.dataset_query.native.query === 'SELECT 1');
+  const n2 = normalizeCard({ ...card, legacy_query: 'not json {' });
+  check('pmbql', 'unparseable legacy_query falls back to the normalizer',
+    n2.dataset_query.type === 'native' && n2.dataset_query.native.query === 'SELECT 2');
+}
+
+// ── pMBQL dashboard: tag wiring, conditional formats, series settings, object ─
+{
+  const r = convertMetabaseDashboardToSigma(read('pmbql-params.dashboard.json'), { metadata });
+  const els = r.workbook.pages.flatMap((p) => p.elements) as any[];
+  const table = els.find((e) => e.name === 'Filtered Revenue (pMBQL Native + Tags)');
+  const bar = els.find((e) => e.name === 'Weekly Orders by Region (pMBQL)');
+  check('pmbql-wb', 'parameters → controls (string/= list + date/range)',
+    (r.workbook.controls || []).some((c) => c.controlId === 'region_param' && c.controlType === 'list')
+    && (r.workbook.controls || []).some((c) => c.controlId === 'order_window' && c.controlType === 'date-range'));
+  check('pmbql-wb', 'variable + field-filter template-tag targets recorded in parameterWiring',
+    (r.parameterWiring || []).some((w) => w.slug === 'region_param' && w.tag === 'region' && w.kind === 'variable')
+    && (r.parameterWiring || []).some((w) => w.slug === 'order_date_param' && w.tag === 'order_date' && w.kind === 'field-filter'));
+  check('pmbql-wb', 'tag wiring warnings AGGREGATED (one per parameter, not per mapping)',
+    r.warnings.filter((w) => /drives native template tag/.test(w)).length === 2);
+  check('pmbql-wb', 'pMBQL dimension target (opts-second field) → hidden bool + include-[true] filter',
+    bar?.columns?.some((c: any) => c.hidden && /= \[order_window\]$/.test(c.formula))
+    && bar?.filters?.some((f: any) => f.kind === 'list' && f.values?.[0] === true));
+  check('pmbql-wb', 'table.column_formatting single rule → conditionalFormats; range rule flagged',
+    table?.conditionalFormats?.length === 1
+    && table.conditionalFormats[0].condition === '>'
+    && table.conditionalFormats[0].style?.backgroundColor === '#22c55e'
+    && r.warnings.some((w) => /gradient\/range/.test(w)));
+  check('pmbql-wb', 'series_settings title renames the series column',
+    bar?.columns?.some((c: any) => c.name === 'Revenue ($)')
+    && r.warnings.some((w) => /per-series color/.test(w)));
+  check('pmbql-wb', 'object display → flagged detail-view table',
+    els.some((e) => e.kind === 'table' && e.name === 'Order Record (object detail)')
+    && r.warnings.some((w) => /object DETAIL view/.test(w)));
+  check('pmbql-wb', 'virtual text card still passes markdown through',
+    els.some((e) => e.kind === 'text' && /## Ops Notes/.test(e.text)));
+}
+
+// ── the two pmbql-normalize.mjs copies must stay byte-identical ──────────────
+{
+  const here = dirname(fileURLToPath(import.meta.url));
+  const a = readFileSync(join(here, 'pmbql-normalize.mjs'), 'utf8');
+  const b = readFileSync(join(here, '..', '..', 'metabase-assessment', 'scripts', 'pmbql-normalize.mjs'), 'utf8');
+  check('sync', 'converter + assessment pmbql-normalize.mjs copies are byte-identical', a === b);
+}
+
 // ── every fixture converts without throwing ──────────────────────────────────
 for (const f of readdirSync(FIX).sort()) {
   try {
     if (f.endsWith('.card.json')) {
       const r = convertMetabaseToSigma({ metadata, cards: [read(f)] }, { connectionId: 'c', database: 'CSA', schema: 'TJ' });
-      if (!r.model.pages[0].elements.length) throw new Error('no elements');
+      // a lone flagged card (e.g. multi-stage) may legitimately produce 0 elements — but never silently
+      if (!r.model.pages[0].elements.length && !r.warnings.length) throw new Error('no elements and no warnings');
       console.log(`✓ ${f.padEnd(36)} cards → ${r.stats.elements} elems · ${r.stats.columns} cols · ${r.stats.metrics} metrics · ${r.stats.relationships} rels (${r.warnings.length} warnings)`);
     } else if (f.endsWith('.dashboard.json')) {
       const r = convertMetabaseDashboardToSigma(read(f), { metadata });

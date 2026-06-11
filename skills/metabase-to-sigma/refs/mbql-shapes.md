@@ -1,10 +1,11 @@
 # Metabase source-format shapes (card + dashboard JSON, MBQL)
 
-What the converter parses. Written from the public MBQL reference and API docs;
-shapes marked ⚠ have version variants. **Not yet verified against a live
-instance** — when you get one, diff a real `GET /api/card/{id}` against this and
-fix drift here first (this file is the contract `converter/` + the assessment
-scorer are built to).
+What the converter parses. Written from the public MBQL reference and API docs,
+then **verified against a live production estate (Metabase Cloud v1.61.4,
+7,023 cards / 1,548 dashboards)**; shapes marked ⚠ have version variants. The
+biggest production finding: modern instances return **pMBQL** ("lib/" MBQL) —
+see the section at the bottom; everything below it is the LEGACY shape the
+converter operates on after `pmbql-normalize.mjs` runs at intake.
 
 ## Card JSON (`GET /api/card/{id}`)
 
@@ -130,3 +131,49 @@ legacy `["metric", id]`. Named via the `aggregation-options` wrapper.
   flagged, not converted (Sigma actions are a manual follow-up).
 - **`trend` / `smartscalar`** — the KPI value converts; the auto "vs previous
   period" comparison line is flagged (rebuild with a Sigma KPI comparison).
+
+## pMBQL ("lib/" MBQL) — what modern instances ACTUALLY return
+
+**Production finding (2026-06, Metabase Cloud v1.61.4): 100% of a 7,023-card
+estate returned `dataset_query` in pMBQL form**, not the legacy shape above. A
+single card-list response may contain EITHER format depending on instance
+version — sniff the `lib/type` key, never the version string.
+
+```jsonc
+{
+  "lib/type": "mbql/query",
+  "database": 134,
+  "stages": [                                   // legacy nests source-query; pMBQL chains stages
+    {
+      "lib/type": "mbql.stage/mbql",            // or "mbql.stage/native"
+      "source-table": 8391,                     // or "source-card": N  (legacy: "card__N")
+      "aggregation": [["count", {"lib/uuid": "…"}]],
+      "breakout":    [["field", {"lib/uuid": "…", "base-type": "type/DateTime", "temporal-unit": "week"}, 124164]],
+      "filters": [                              // ARRAY (implicit AND) — legacy has a single "filter"
+        ["=", {"lib/uuid": "…"}, ["field", {…}, 124158], "AU"],
+        ["in", {"lib/uuid": "…"}, ["field", {…}, 124161], "A", "B"]   // pMBQL multi-value op
+      ],
+      "expressions": [                          // LIST of clauses — legacy is a {name: clause} map
+        ["datetime-diff", {"lib/uuid": "…", "lib/expression-name": "Cohort Age"}, …]
+      ],
+      "joins": [{ "lib/type": "mbql/join", "alias": "…", "strategy": "left-join",
+                  "stages": [{"source-table": 46}], "conditions": [ … ], "fields": "all" }]
+    }
+  ]
+}
+```
+
+Key invariant: **every pMBQL clause is `[op, {opts}, …args]` — the options map
+is ALWAYS the second element** (legacy puts it last, or third for `field`).
+Native stages carry the SQL directly: `{"lib/type": "mbql.stage/native",
+"native": "<sql>", "template-tags": {…}}` (template-tag `dimension` refs are
+pMBQL field clauses too).
+
+`converter/pmbql-normalize.mjs` (byte-identical copy in
+`metabase-assessment/scripts/`) converts all of this to the legacy shape at
+intake in BOTH skills. It prefers the card's **`legacy_query`** field when
+present — a JSON *string* containing the server's own down-conversion (~70% of
+cards on the reference estate carry it) — and falls back to the local
+normalizer. Multi-stage queries (stages > 1; 14 of 7,023 observed) normalize to
+legacy `source-query` nesting, which the converter FLAGS (rebuild as chained
+Sigma elements), never mistranslates.

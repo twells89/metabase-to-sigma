@@ -2,9 +2,12 @@
 
 Everything this skill needs is on Metabase's first-class REST API — open source and
 Pro/EE alike. No private endpoints. Written from the public API docs
-(`<host>/api/docs` on any instance ≥ v48); **verify shapes against the live instance
-before trusting field names** — this skill has NOT yet been validated against a live
-Metabase (see repo README status).
+(`<host>/api/docs` on any instance ≥ v48) and **validated read-side against a live
+production estate (Metabase Cloud v1.61.4, 7,023 cards / 1,548 dashboards)**. The
+conversion BUILD path (POST to Sigma) is still fixture-validated only — see repo
+README status. Production note: modern instances return `dataset_query` in
+**pMBQL** form and often include a `legacy_query` JSON string — see
+`mbql-shapes.md` § pMBQL.
 
 ## Auth (two options)
 
@@ -26,7 +29,8 @@ Metabase (see repo README status).
 | Collections (folder tree) | `GET /api/collection` | flat list with `location` path (`/3/7/`); `personal_owner_id` ≠ null = personal space |
 | Collection items | `GET /api/collection/{id}/items?models=card&models=dashboard&models=dataset` | paginated (`limit`/`offset`, default 50ish); `data[]` of `{id, model, name}` |
 | **Card (question/model) def** | `GET /api/card/{id}` | the full definition incl `dataset_query` (MBQL or native), `display`, `visualization_settings`, `result_metadata` — see `refs/mbql-shapes.md` |
-| All cards (small estates) | `GET /api/card` | unpaginated full list — fine < ~500 cards, else walk collections |
+| **All cards (bulk)** | `GET /api/card` | unpaginated — returns EVERY card **with its full definition** in one response (~110MB for 7k cards on the reference estate). Stream to disk, then split locally (`metabase-assessment/scripts/mb-bulk-split.py`). This beats the per-item walk by ~60× on big estates |
+| **Single field** | `GET /api/field/{id}` | field-id → `{name, display_name, table_id, base_type}`. The fallback when `/api/database/{id}/metadata` 403s on a scoped key — **worked even for restricted DBs on the reference estate**. Resolution chain: db metadata → card `result_metadata` → `GET /api/field/{id}` → names from the SQL when native |
 | **Dashboard def** | `GET /api/dashboard/{id}` | `dashcards[]` with grid geometry + embedded `card` + `parameter_mappings`; top-level `parameters[]`, `tabs[]` |
 | Search | `GET /api/search?q=...&models=card` | quick lookup by name |
 | Recent views | `GET /api/activity/recents` | thin usage signal (see assessment skill's `usage-telemetry.md`) |
