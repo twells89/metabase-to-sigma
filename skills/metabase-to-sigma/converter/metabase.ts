@@ -652,6 +652,19 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
         columns: [], order: [],
       };
       target = newCtx(element, true);
+      // Passthrough the parent's columns — a table-sourced element starts EMPTY
+      // (zero queryable columns live-verified), so anything consuming this element
+      // (the workbook chart for this very card) has nothing to reference without them.
+      const parentCtx = elemCtxs.find((c) => c.element.id === parentElemId);
+      const parentName = parentCtx?.element.name || 'Parent';
+      for (const pc of parentCtx?.columns || []) {
+        const tail = pc.name || /\/([^\]/]+)\]$/.exec(String(pc.formula || ''))?.[1];
+        if (!tail || target.colIdByName.has(tail.toLowerCase())) continue;
+        const id = sigmaShortId();
+        target.columns.push({ id, name: tail, formula: `[${parentName}/${tail}]` });
+        target.order.push(id);
+        target.colIdByName.set(tail.toLowerCase(), id);
+      }
     } else if (Array.isArray(q.joins) && q.joins.length) {
       target = buildJoinElement(card, q, ctxM);
     } else if (typeof src === 'number') {

@@ -188,3 +188,22 @@ kind, AP-style last-word casing, pivot `field_ref:null`, implicit-FK dim-table
 ensure, explicit-join cards sourcing their card-named element. Plus two script
 bugs any first run would hit: six scripts committed without exec bits, and
 `metabase-discover.sh` f-string escapes that crash python ≤3.11.
+
+### §10b Gold round (same day): model + nested question + combo — EXACT parity
+
+Second pilot wave on the local harness: a curated **model** (`type:"model"`,
+ORDER_FACT ⟕ CUSTOMER_DIM + expression), a **nested question** (`card__N` on the
+model, agg by joined-dim breakout — nested field refs are STRING form
+`["field","NAME",{base-type}]`), and a **combo** chart (2 aggs, per-series
+`series_settings` bar/line + right axis). All three POST clean and match
+Metabase exactly (tiers 22,212.23/32,057.13/21,624.46/31,663.30; channels
+62,316.78/842 · 31,964.18/411 · 16,507.39/228). Combo dual-axis persists via the
+bare-string vs `{columnId, type:'line'}` yAxis form.
+
+Two converter fixes from this round:
+- **Nested-card DM elements need parent passthrough columns** — a table-sourced
+  element starts EMPTY (zero queryable columns live-verified), so the element now
+  copies `[Parent Name/Col]` passthroughs for every parent column.
+- **`card__N` dashcards whose parent is NOT on the dashboard** now source the
+  card's OWN DM element by card name (a `card__N` placeholder 400s at POST);
+  passing `cardNameById` still routes to the parent model instead.

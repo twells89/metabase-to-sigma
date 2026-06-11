@@ -184,6 +184,14 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
       const n = Number(src.slice('card__'.length));
       const mapped = options.cardNameById?.[n];
       if (mapped) return mapped;
+      // Parent card not on this dashboard and no mapping provided — the DM
+      // converter gives the NESTED card its own element (sourced from the parent),
+      // so this card's own name is the resolvable placeholder (live-verified;
+      // a "card__N" placeholder 400s at POST).
+      if (card.name) {
+        warnings.push(`card "${card.name}" sources nested card ${n} — no card-name mapping; sourced its OWN DM element by card name (the DM converter creates one per nested card). Pass cardNameById to source the parent model instead.`);
+        return card.name;
+      }
       warnings.push(`card "${card.name}" sources nested card ${n} — no card-name mapping provided; emitted placeholder "card__${n}" (remap will report it unresolved; pass cardNameById or fix by hand).`);
       return `card__${n}`;
     }
