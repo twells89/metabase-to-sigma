@@ -57,6 +57,13 @@ const payload = isDashboard ? res.workbook : res.model;
 process.stdout.write(JSON.stringify(payload, null, 2) + '\n');
 console.error(`\n[${isDashboard ? 'dashboard→workbook' : 'cards→data-model'}] stats: ${JSON.stringify(res.stats)}`);
 
+// 1:1 Metabase grid geometry (row/col/sizeX/sizeY per element) — feed to
+// scripts/apply-layout.mjs --hints to reproduce the dashboard layout exactly.
+if (isDashboard && res.layout && opt('layout-out')) {
+  writeFileSync(opt('layout-out'), JSON.stringify(res.layout, null, 2));
+  console.error(`layout hints → ${opt('layout-out')}`);
+}
+
 // Detected security (Metabase sandboxing) — detect-only; apply_sigma_rls.py ports it.
 if (res.security?.length) {
   const out = opt('security-out', 'security.json');

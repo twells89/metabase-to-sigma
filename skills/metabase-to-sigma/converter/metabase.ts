@@ -632,7 +632,9 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
       };
       const ctx = newCtx(element, true);
       for (const rm of card.result_metadata || []) {
-        const disp = rm.display_name || sigmaDisplayName(rm.name);
+        // Prettify ALWAYS (sigmaDisplayName is idempotent): native-card display_name
+        // is the raw alias (x_axis_type), which otherwise becomes the chart label.
+        const disp = sigmaDisplayName(rm.display_name || rm.name);
         const id = sigmaShortId();
         // sql-element column refs MUST be [Custom SQL/ALIAS] (raw SQL output alias).
         // Bare [Display Name] refs POST 200 but resolve to type "error" at query

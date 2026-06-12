@@ -109,7 +109,29 @@ for (const p of wb.pages || []) for (const e of p.elements || []) {
   if (real) { s.elementId = real; remapped++; repairRefs(e, real); } else unresolved.push(s.elementId);
 }
 
+// ── wire workbook controls to the DM controls they duplicate ─────────────────
+// The DM converter emits a control per {{tag}} (the tag lives in DM SQL); the
+// dashboard converter emits a control per dashboard parameter with the SAME
+// controlId (slug). Without wiring, the workbook control is decorative — pass
+// --dm-spec <the dm spec JSON you POSTed> to set control.parameters so the
+// workbook control DRIVES the DM control.
+let wired = 0;
+if (a['dm-spec']) {
+  const dmSpec = JSON.parse(readFileSync(a['dm-spec'], 'utf8'));
+  const dmControlIds = new Set();
+  for (const p of dmSpec.pages || []) for (const e of p.elements || []) {
+    if (e.kind === 'control' && e.controlId) dmControlIds.add(e.controlId);
+  }
+  const wireControl = (c) => {
+    if (c?.kind !== 'control' || !dmControlIds.has(c.controlId)) return;
+    c.parameters = [{ kind: 'data-model', dataModelId: dmId, controlId: c.controlId }];
+    wired++;
+  };
+  for (const c of wb.controls || []) wireControl(c);
+  for (const p of wb.pages || []) for (const e of p.elements || []) wireControl(e);
+}
+
 const out = a.out || a.wb.replace(/\.json$/, '.remapped.json');
 writeFileSync(out, JSON.stringify(wb, null, 2));
-console.log(JSON.stringify({ dataModelId: dmId, dmElements: els.length, remapped, repaired, unrepairable, unresolved, out }, null, 2));
+console.log(JSON.stringify({ dataModelId: dmId, dmElements: els.length, remapped, repaired, unrepairable, controlsWired: wired, unresolved, out }, null, 2));
 if (unresolved.length) { console.error(`WARN: ${unresolved.length} elementId(s) unresolved — DM has no element named: ${unresolved.join(', ')}`); process.exit(1); }

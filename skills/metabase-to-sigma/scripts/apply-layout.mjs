@@ -8,13 +8,23 @@
 //
 // Usage:
 //   eval "$(scripts/get-token.sh)"
-//   node scripts/apply-layout.mjs --workbook <workbookId>
+//   node scripts/apply-layout.mjs --workbook <workbookId> [--hints layout-hints.json]
+//
+// --hints (from `cli.ts … --layout-out hints.json`) reproduces the ORIGINAL
+// Metabase dashboard geometry 1:1 (24-col grid, row/col/sizeX/sizeY per element;
+// element ids are preserved on workbook CREATE so hints match the live spec).
+// Controls aren't Metabase dashcards, so they get a top band; hinted content is
+// placed below at exact coordinates; unhinted leftovers stack at the bottom.
+// Without --hints, falls back to the generic per-kind stacked layout.
 //
 // Idempotent. Run it as the last step of the build/verify phase.
+import { readFileSync } from 'node:fs';
 import { api, parseArgs } from './lib/sigma-rest.mjs';
 
 const a = parseArgs(process.argv.slice(2));
-if (!a.workbook) { console.error('need --workbook <workbookId>'); process.exit(2); }
+if (!a.workbook) { console.error('need --workbook <workbookId> [--hints hints.json]'); process.exit(2); }
+const hints = a.hints ? JSON.parse(readFileSync(a.hints, 'utf8')) : null;
+const ROWSCALE = 2; // Metabase row unit → Sigma grid rows (proportions, rows are "auto")
 
 // per-kind row-unit heights (24-col grid; rows are "auto" so spans set relative size)
 const H = (k) => k === 'control' ? 2
@@ -22,6 +32,58 @@ const H = (k) => k === 'control' ? 2
   : k.endsWith('-chart') ? 10
   : (k.endsWith('-map') || k === 'pivot-table' || k === 'table') ? 12
   : k === 'text' ? 3 : 10;
+
+// Exact mode: place each hinted element at its Metabase grid coordinates.
+function pageLayoutExact(page, hintEls) {
+  const els = (page.elements || []).filter((e) => e.id);
+  if (els.length < 2) return null;
+  const byId = new Map(els.map((e) => [e.id, e]));
+  // name fallback queues (texts share names — consume in order)
+  const byName = new Map();
+  for (const e of els) {
+    const k = String(e.name || e.kind || '').toLowerCase();
+    if (!byName.has(k)) byName.set(k, []);
+    byName.get(k).push(e);
+  }
+  const controls = els.filter((e) => e.kind === 'control');
+  const lines = [];
+  let row = 1;
+  controls.forEach((c, i) => {
+    const perRow = Math.min(controls.length, 4);
+    const span = Math.floor(24 / perRow);
+    const col0 = 1 + (i % perRow) * span;
+    const r = row + Math.floor(i / perRow) * H('control');
+    const col1 = (i % perRow === perRow - 1) ? 25 : col0 + span;
+    lines.push(`  <LayoutElement elementId="${c.id}" gridColumn="${col0} / ${col1}" gridRow="${r} / ${r + H('control')}"/>`);
+  });
+  if (controls.length) row += Math.ceil(controls.length / 4) * H('control');
+
+  const placed = new Set(controls.map((c) => c.id));
+  let maxRow = row;
+  for (const h of hintEls || []) {
+    let el = byId.get(h.elementId);
+    if (!el || placed.has(el.id)) {
+      const q = byName.get(String(h.name || '').toLowerCase()) || [];
+      el = q.find((e) => !placed.has(e.id));
+    }
+    if (!el || placed.has(el.id) || el.kind === 'control') continue;
+    placed.add(el.id);
+    const c0 = Math.max(1, (h.col ?? 0) + 1);
+    const c1 = Math.min(25, c0 + Math.max(h.sizeX ?? 4, 1));
+    const r0 = row + (h.row ?? 0) * ROWSCALE;
+    const r1 = r0 + Math.max((h.sizeY ?? 4) * ROWSCALE, 2);
+    lines.push(`  <LayoutElement elementId="${el.id}" gridColumn="${c0} / ${c1}" gridRow="${r0} / ${r1}"/>`);
+    if (r1 > maxRow) maxRow = r1;
+  }
+  // anything unhinted stacks full-width below the hinted grid
+  for (const e of els) {
+    if (placed.has(e.id)) continue;
+    const h = H(e.kind);
+    lines.push(`  <LayoutElement elementId="${e.id}" gridColumn="1 / 25" gridRow="${maxRow} / ${maxRow + h}"/>`);
+    maxRow += h;
+  }
+  return `<Page type="grid" gridTemplateColumns="repeat(24, 1fr)" gridTemplateRows="auto" id="${page.id}">\n${lines.join('\n')}\n</Page>`;
+}
 
 function pageLayout(page) {
   const els = (page.elements || []).filter((e) => e.id);
@@ -73,8 +135,16 @@ if (!got.json) { console.error(`GET spec failed (HTTP ${got.status}): ${got.text
 const spec = got.json;
 // The layout is a SINGLE top-level `spec.layout` XML holding one <Page> block per page
 // (NOT pages[].layout — that's silently dropped). Strip read-only fields before the PUT.
+const hintPageByName = new Map((hints?.pages || []).map((p) => [String(p.name || '').toLowerCase(), p.elements || []]));
 const pageBlocks = [];
-for (const p of spec.pages || []) { delete p.layout; const xml = pageLayout(p); if (xml) pageBlocks.push(xml); }
+let exactPages = 0;
+for (const p of spec.pages || []) {
+  delete p.layout;
+  const hintEls = hintPageByName.get(String(p.name || '').toLowerCase());
+  const xml = hintEls?.length ? (exactPages++, pageLayoutExact(p, hintEls)) : pageLayout(p);
+  if (xml) pageBlocks.push(xml);
+}
+if (hints) console.error(`exact-grid pages: ${exactPages}/${(spec.pages || []).length}`);
 if (!pageBlocks.length) { console.log('no multi-element pages — nothing to lay out'); process.exit(0); }
 spec.layout = `<?xml version="1.0" encoding="utf-8"?>\n${pageBlocks.join('\n')}`;
 for (const k of ['workbookId', 'url', 'ownerId', 'createdBy', 'updatedBy', 'createdAt', 'updatedAt', 'latestDocumentVersion', 'documentVersion']) delete spec[k];

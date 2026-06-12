@@ -232,3 +232,36 @@ encoded and tested (`fixtures/bq-estate.card.json` + the `bq:` test block):
 - **Cross-warehouse** (Metabase-on-BQ → Sigma-on-Snowflake) remains the one real
   gap: the 91%-native-SQL estate would need a transpile pass before passthrough —
   flag, don't fake.
+
+### §10d Customer-feedback round (Eucalyptus wave 0 — Margaret, 2026-06-12)
+
+Four reported issues, each reproduced on the customer's real dashboard (defs
+from the estate cache) and fixed:
+
+1. **Grain switchers** (`{{date_aggregation}}` driven by a static-list param) —
+   parameters with `values_source_type: "static-list"` now become a Sigma
+   **segmented control** (≤6 values; larger lists stay `list`) with a manual
+   value source and the Metabase default carried over. The {{tag}} in SQL stays
+   verbatim. Number defaults are coerced from Metabase's strings.
+2. **Raw aliases as chart labels** (`x_axis_type`, `count(*)`) — column display
+   names are now ALWAYS prettified (sigmaDisplayName is idempotent); formulas
+   keep the raw alias ([Custom SQL/x_axis_type]). BQ's anonymous `f0_` becomes
+   "F 0" — alias aggregates in SQL for a better label.
+3. **Controls not driving anything** — remap gains `--dm-spec`: workbook
+   controls whose controlId matches a DM {{tag}} control get
+   `parameters: [{kind:'data-model', dataModelId, controlId}]` (the OpenAPI
+   shape on BOTH spec paths). NOTE: live POST currently rejects the binding
+   ("Invalid parameter on control") even type-matched and id-vs-controlId —
+   likely the DM control must be UI-exposed as a parameter first.
+   post-and-readback now strips the bindings and retries ONCE with a loud
+   warning; sync each control in the UI (control → Sync with data source
+   parameter). Re-probe occasionally — if the platform starts accepting it,
+   the wiring is already emitted.
+4. **Stacked layout** — `cli.ts --layout-out hints.json` exports the 1:1
+   Metabase grid geometry; `apply-layout.mjs --hints hints.json` reproduces it
+   exactly (24-col, ROWSCALE=2, controls in a top band, unhinted leftovers
+   stacked below; element ids preserved on workbook CREATE so hints match).
+   Without --hints the generic per-kind layout still applies.
+
+Run order per dashboard: convert (--layout-out) → remap (--dm-spec) →
+post-and-readback → apply-layout (--hints) → assert-parity.

@@ -20,7 +20,21 @@ const colsPath = (id) => a.type === 'datamodel' ? `/v2/dataModels/${id}/columns`
 const spec = JSON.parse(readFileSync(a.spec, 'utf8'));
 // name AFTER the spread — `{name, ...spec}` let spec.name silently override --name (beads-sigma-unff).
 const body = { folderId: a.folder, ...spec, name: a.name || spec.name || `metabase ${a.type} ${Date.now()}` };
-const post = await api('POST', postPath, body);
+let post = await api('POST', postPath, body);
+// Control→DM-parameter bindings (remap --dm-spec) can be rejected by orgs where
+// data-model parameter targeting isn't enabled — strip them and retry ONCE,
+// loudly: the dashboard still posts; sync each control to its DM control in the
+// UI (control → Settings → "Sync with data source parameter").
+if (!post.ok && /Invalid parameter on control/.test(post.text)) {
+  let stripped = 0;
+  const stripParams = (c) => { if (c?.kind === 'control' && c.parameters) { delete c.parameters; stripped++; } };
+  for (const c of body.controls || []) stripParams(c);
+  for (const p of body.pages || []) for (const e of p.elements || []) stripParams(e);
+  if (stripped) {
+    console.error(`WARN: org rejected control→data-model parameter bindings — stripped ${stripped} and retrying. The controls POST but are NOT wired to the DM {{tag}} controls; sync them in the UI (or set values on the DM controls directly).`);
+    post = await api('POST', postPath, body);
+  }
+}
 const id = extractId(post, idField);
 if (!id) { console.error(`POST failed (HTTP ${post.status}): ${post.text.slice(0, 500)}`); process.exit(1); }
 console.error(`POST ok → ${idField}=${id}`);

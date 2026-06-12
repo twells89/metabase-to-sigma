@@ -129,10 +129,40 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
     const { type, warn } = controlTypeFor(p.type);
     if (warn) warnings.push(`parameter "${p.name}" (${p.type}): ${warn}`);
     if (!type) continue;
-    controls.push({
+    const ctrl: any = {
       id: sigmaShortId(), kind: 'control', controlId: p.slug || p.id, name: p.name || p.slug,
-      controlType: type, value: p.default ?? null,
-    });
+      controlType: type,
+    };
+    // Metabase static value list (e.g. day/week/month grain switchers) → Sigma's
+    // segmented control (the native idiom for small fixed choices); larger lists
+    // stay a list control with a manual source.
+    const staticVals: any[] | null =
+      p.values_source_type === 'static-list' ? (p.values_source_config?.values || null) : null;
+    if (staticVals?.length && type === 'list') {
+      ctrl.controlType = staticVals.length <= 6 ? 'segmented' : 'list';
+      ctrl.source = {
+        kind: 'manual',
+        valueType: typeof staticVals[0] === 'number' ? 'number' : 'text',
+        values: staticVals,
+      };
+    }
+    // Union discriminants are REQUIRED per controlType (same live-verified contract
+    // as DM controls — omitting them fails validation as `Invalid kind: "control"`).
+    if (ctrl.controlType === 'text') ctrl.mode = 'equals';
+    if (ctrl.controlType === 'number') ctrl.mode = '=';
+    if (ctrl.controlType === 'date') ctrl.mode = '=';
+    // Defaults: list controls take `values` (array), everything else scalar `value`;
+    // never emit an explicit null.
+    if (p.default != null) {
+      if (ctrl.controlType === 'list') ctrl.values = Array.isArray(p.default) ? p.default : [p.default];
+      else {
+        let v = Array.isArray(p.default) ? p.default[0] : p.default;
+        // Metabase stores number defaults as strings ("20") — Sigma number controls want numbers.
+        if (ctrl.controlType === 'number' && typeof v === 'string' && v.trim() !== '' && !isNaN(Number(v))) v = Number(v);
+        ctrl.value = v;
+      }
+    }
+    controls.push(ctrl);
   }
 
   // field-id → display name (metadata first; result_metadata fallback per card)
@@ -298,7 +328,9 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
           if (b) fr = b;
         }
       }
-      let formula = ''; let isMetric = false; let nm = rm.display_name || sigmaDisplayName(rm.name || 'Column');
+      // Prettify ALWAYS (idempotent) — raw native aliases (x_axis_type, count(*))
+      // otherwise become the visible axis/column labels.
+      let formula = ''; let isMetric = false; let nm = sigmaDisplayName(rm.display_name || rm.name || 'Column');
       if (Array.isArray(fr) && fr[0] === 'aggregation') {
         const agg = q?.aggregation?.[fr[1]];
         if (agg) {

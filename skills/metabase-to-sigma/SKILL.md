@@ -119,20 +119,25 @@ non-zero exit.
 ## Phase 3 — Convert the dashboard → Sigma workbook, wired to the DM
 
 ```bash
-node --import tsx/esm cli.ts ../exec.dashboard.json --metadata ../metadata.json --dm <dataModelId> > wb.json
-node scripts/remap-wb-to-dm-ids.mjs --wb wb.json --dm-id <dataModelId> --out wb.remapped.json
+node --import tsx/esm cli.ts ../exec.dashboard.json --metadata ../metadata.json --dm <dataModelId> --layout-out hints.json > wb.json
+node scripts/remap-wb-to-dm-ids.mjs --wb wb.json --dm-id <dataModelId> --dm-spec dm.json --out wb.remapped.json
 node scripts/post-and-readback.mjs --type workbook --spec wb.remapped.json --folder <folderId>
-node scripts/apply-layout.mjs --workbook <workbookId>
+node scripts/apply-layout.mjs --workbook <workbookId> --hints hints.json
 ```
 
 Each dashcard becomes the matching Sigma element sourced from the migrated DM element
 (KPI/bar/line/area/pie/combo/scatter/table/pivot/map; text cards → text elements;
 funnel/gauge/progress/waterfall → flagged tables). The converter emits each element's
 `source.elementId` as the source card/table **name** (a placeholder) —
-`remap-wb-to-dm-ids.mjs` rewrites those to real ids from Phase 2's readback. Dashboard
-**parameters** become Sigma controls wired by controlId, with per-card targets from
-`parameter_mappings`. Metabase's 24-col dashcard grid maps 1:1 onto Sigma's layout —
-`apply-layout.mjs` writes it and confirms it survives readback.
+`remap-wb-to-dm-ids.mjs` rewrites those to real ids from Phase 2's readback (native
+cards all read back "Custom SQL", so it falls back to column-set fingerprints and
+repairs every formula ref against the live DM columns). Dashboard **parameters**
+become Sigma controls wired by controlId (static-list params → segmented controls
+with values + defaults); `--dm-spec` additionally emits control→DM-parameter
+bindings — if the org rejects them, post-and-readback strips and warns: sync those
+controls in the UI. Metabase's 24-col dashcard grid maps 1:1 onto Sigma's layout —
+`apply-layout.mjs --hints` reproduces the exact geometry and confirms it survives
+readback (without `--hints` it falls back to a clean generic layout).
 
 ## Phase 4 — Verify parity (hard gate — the real proof)
 
