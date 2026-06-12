@@ -159,3 +159,16 @@ const ok = /<LayoutElement/.test(rb.json?.layout || '');
 console.log(JSON.stringify({ workbookId: a.workbook, pagesLaidOut: pageBlocks.length, layoutOnReadback: ok }, null, 2));
 if (!ok) { console.error('FAIL: layout did not survive readback (check elementId matches)'); process.exit(1); }
 console.error(`clean layout applied (${pageBlocks.length} page block(s))`);
+
+// shared layout lint on the laid-out readback spec (same lib gate 6 runs —
+// scripts/lib/layout_lint.rb, vendored byte-identical across plugins)
+{
+  const { writeFileSync } = await import('node:fs');
+  const { dirname, join } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const { spawnSync } = await import('node:child_process');
+  const tmp = `/tmp/layout-lint-${a.workbook}.spec.json`;
+  writeFileSync(tmp, JSON.stringify(rb.json, null, 2));
+  const lint = spawnSync('ruby', [join(dirname(fileURLToPath(import.meta.url)), 'lib', 'layout_lint.rb'), tmp], { stdio: 'inherit' });
+  if (lint.status !== 0) { console.error('FAIL: layout lint violations on the applied layout (see above) — fix and re-run.'); process.exit(1); }
+}

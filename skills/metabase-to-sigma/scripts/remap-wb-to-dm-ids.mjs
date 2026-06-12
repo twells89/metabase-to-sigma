@@ -73,6 +73,15 @@ for (const c of colEntries) {
   if (!m.get(n).includes(c.name)) m.get(n).push(c.name);
 }
 let repaired = 0; const unrepairable = [];
+// Control references ([<controlId>] in boolean match columns like
+// `[Region] = [region]`) must survive repair UNTOUCHED — rewriting `[region]`
+// to `[Customer Dim/Region]` turns the filter into always-true (live-caught by
+// the control lint: the control reads back dead).
+const controlIds = new Set();
+for (const c of wb.controls || []) if (c.controlId) controlIds.add(c.controlId);
+for (const p of wb.pages || []) for (const e of p.elements || []) {
+  if (e.kind === 'control' && e.controlId) controlIds.add(e.controlId);
+}
 const repairRefs = (e, elId) => {
   const elName = nameByElement.get(elId);
   const colMap = colNamesByElement.get(elId);
@@ -91,6 +100,7 @@ const repairRefs = (e, elId) => {
   for (const c of e.columns || []) {
     if (typeof c.formula !== 'string') continue;
     c.formula = c.formula.replace(/\[([^\]]+)\]/g, (whole, inner) => {
+      if (controlIds.has(inner)) return whole;       // control ref — never a column
       const slash = inner.indexOf('/');
       const colTok = slash >= 0 ? inner.slice(slash + 1) : inner;
       const real = resolveCol(colTok);
@@ -101,8 +111,15 @@ const repairRefs = (e, elId) => {
   }
 };
 
+// Intra-workbook sources (charts re-rooted through a hidden base TABLE so a
+// range control's `filters` target has a table to point at — see the converter's
+// pendingRanges) reference another element's id, not a DM placeholder: skip them.
+const inWorkbookIds = new Set();
+for (const p of wb.pages || []) for (const e of p.elements || []) if (e.id) inWorkbookIds.add(e.id);
+
 for (const p of wb.pages || []) for (const e of p.elements || []) {
   const s = e.source; if (!s || !('elementId' in s)) continue;
+  if (inWorkbookIds.has(s.elementId)) continue;          // base-table source — already real
   s.dataModelId = dmId;
   const want = String(s.elementId || '').toLowerCase();
   const real = byName.get(want) || byColumns(e) || (els.length === 1 ? els[0].id : undefined);

@@ -183,7 +183,9 @@ export function translateMbqlExpr(node: any, ctx: MbqlCtx): string {
     case 'float': return `Number(${t(node[1])})`;
     case 'date': return `DateTrunc("day", ${t(node[1])})`;   // date(x) = day-truncated datetime
 
-    // comparisons — multi-value `=` ⇒ Or chain (Sigma has NO IsIn); multi `!=` ⇒ And chain
+    // comparisons — multi-value `=` ⇒ infix `or` chain; multi `!=` ⇒ infix `and` chain.
+    // Sigma has NO IsIn, and NO Or()/And() FUNCTIONS either — `Or(a, b)` returns
+    // "Invalid formula" at POST (live-verified 2026-06-12); and/or are infix only.
     // (pMBQL `in`/`not-in` are normalized to multi-value =/!= upstream; aliased here too)
     case 'in': case 'not-in': case '=': case '!=': {
       const eq = op === '=' || op === 'in' ? '=' : '!=';
@@ -191,18 +193,18 @@ export function translateMbqlExpr(node: any, ctx: MbqlCtx): string {
       const vals = node.slice(2).map(t);
       if (vals.length <= 1) return `${a} ${eq} ${vals[0] ?? 'Null'}`;
       const parts = vals.map((v: string) => `${a} ${eq} ${v}`);
-      return eq === '=' ? `Or(${parts.join(', ')})` : `And(${parts.join(', ')})`;
+      return eq === '=' ? `(${parts.join(' or ')})` : `(${parts.join(' and ')})`;
     }
     case '<': case '<=': case '>': case '>=':
       return `${t(node[1])} ${op} ${t(node[2])}`;
     case 'between': return `Between(${t(node[1])}, ${t(node[2])}, ${t(node[3])})`;
-    case 'and': return `And(${args().join(', ')})`;
-    case 'or': return `Or(${args().join(', ')})`;
+    case 'and': return `(${args().join(' and ')})`;
+    case 'or': return `(${args().join(' or ')})`;
     case 'not': return `Not(${t(node[1])})`;
     case 'is-null': return `IsNull(${t(node[1])})`;
     case 'not-null': return `IsNotNull(${t(node[1])})`;
-    case 'is-empty': return `Or(IsNull(${t(node[1])}), ${t(node[1])} = "")`;
-    case 'not-empty': return `And(IsNotNull(${t(node[1])}), ${t(node[1])} != "")`;
+    case 'is-empty': return `(IsNull(${t(node[1])}) or ${t(node[1])} = "")`;
+    case 'not-empty': return `(IsNotNull(${t(node[1])}) and ${t(node[1])} != "")`;
 
     case 'starts-with': case 'ends-with': case 'contains': case 'does-not-contain': {
       const fn = op === 'starts-with' ? 'StartsWith' : op === 'ends-with' ? 'EndsWith' : 'Contains';
@@ -224,7 +226,7 @@ export function translateMbqlExpr(node: any, ctx: MbqlCtx): string {
     case 'inside': {
       // ["inside", latField, lonField, latMax, lonMin, latMin, lonMax] → lat/lon Between pair
       const [lat, lon, latMax, lonMin, latMin, lonMax] = node.slice(1).map(t);
-      return `And(Between(${lat}, ${latMin}, ${latMax}), Between(${lon}, ${lonMin}, ${lonMax}))`;
+      return `(Between(${lat}, ${latMin}, ${latMax}) and Between(${lon}, ${lonMin}, ${lonMax}))`;
     }
 
     // ── aggregations (legal at the top of an aggregation clause) ──────────────

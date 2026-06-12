@@ -31,7 +31,7 @@ every row in this table is expressed in legacy clause order. See
 | `["round"/"floor"/"ceil"/"abs"/"sqrt"/"exp", x]` | `Round/Floor/Ceiling/Abs/Sqrt/Exp(x)` | |
 | `["text", x]` / `["float", x]` / `["integer", x]` | `Text(x)` / `Number(x)` / `Int(x)` | v50+ casts |
 | `["date", x]` | `DateTrunc("day", x)` | date(x) = day-truncated datetime |
-| `["in"/"not-in", f, a, b, …]` | `Or(f = a, f = b, …)` / `And(f != a, …)` | pMBQL multi-value ops (also appear in server `legacy_query`) |
+| `["in"/"not-in", f, a, b, …]` | `(f = a or f = b or …)` / `(f != a and …)` | pMBQL multi-value ops (also appear in server `legacy_query`) |
 | `["power", x, y]` | `Power(x, y)` | |
 | `["log", x]` | `Log(x, 10)` | Metabase `log` is base-10 |
 | `["datetime-add", d, n, "unit"]` | `DateAdd("unit", n, d)` | unit string passes through |
@@ -40,9 +40,9 @@ every row in this table is expressed in legacy clause order. See
 | `["get-year"/"get-month"/"get-day"/"get-hour"/"get-quarter", d]` | `DatePart("year"/…, d)` | `get-day-of-week` → `DatePart("dayofweek", d)` |
 | `["now"]` | `Now()` | |
 | `["relative-datetime", -30, "day"]` | `DateAdd("day", -30, Today())` | inside filters |
-| `= != < <= > >=` | `= != < <= > >=` | `["=", f, v1, v2]` (multi-value) → `Or(f = v1, f = v2)` — Sigma has **no `IsIn`** |
+| `= != < <= > >=` | `= != < <= > >=` | `["=", f, v1, v2]` (multi-value) → `(f = v1 or f = v2)` — Sigma has **no `IsIn`** (and **no `Or()`/`And()` functions** — infix only, live-verified) |
 | `["between", x, lo, hi]` | `Between(x, lo, hi)` | |
-| `["and"/"or"/"not", …]` | `And(…)/Or(…)/Not(…)` | |
+| `["and"/"or"/"not", …]` | infix `(… and …)` / `(… or …)` / `Not(…)` | |
 | `["is-null"/"not-null", x]` | `IsNull(x)` / `IsNotNull(x)` | `is-empty`/`not-empty` add `Or x = ""` for text |
 | `["starts-with"/"ends-with"/"contains", s, sub]` | `StartsWith/EndsWith/Contains(s, sub)` | `does-not-contain` → `Not(Contains(…))`; default case-insensitive in Metabase — wrapped in `Lower()` unless `{"case-sensitive": true}` |
 | `["time-interval", f, -30, "day"]` | `f >= DateAdd("day", -30, Today())` | "previous 30 days" filter idiom; `"current"` → `DateTrunc(unit, f) = DateTrunc(unit, Today())` |

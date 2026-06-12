@@ -10,6 +10,7 @@
  *
  * Options: --metadata <metadata.json> --connection <id> --database <DB> --schema <S>
  *          --dm <dataModelId> --security-out <file>
+ *          --layout-out <file> --control-scope-out <file>   (dashboards only)
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -62,6 +63,15 @@ console.error(`\n[${isDashboard ? 'dashboard→workbook' : 'cards→data-model'}
 if (isDashboard && res.layout && opt('layout-out')) {
   writeFileSync(opt('layout-out'), JSON.stringify(res.layout, null, 2));
   console.error(`layout hints → ${opt('layout-out')}`);
+}
+
+// control-scope.json sidecar (shared cross-plugin contract — see
+// scripts/lib/control_lint.rb header CONTRACT + refs/control-parity.md).
+// Write it NEXT TO the workbook spec in your workdir: post-and-readback and
+// assert-phase6-ran (gate 7) pick it up from there automatically.
+if (isDashboard && res.controlScope && opt('control-scope-out')) {
+  writeFileSync(opt('control-scope-out'), JSON.stringify(res.controlScope, null, 2));
+  console.error(`control scope sidecar → ${opt('control-scope-out')} (sourceFilterSignals=${res.controlScope.sourceFilterSignals}, controls=${res.controlScope.controls.length})`);
 }
 
 // Detected security (Metabase sandboxing) — detect-only; apply_sigma_rls.py ports it.

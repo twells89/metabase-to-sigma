@@ -265,3 +265,62 @@ from the estate cache) and fixed:
 
 Run order per dashboard: convert (--layout-out) → remap (--dm-spec) →
 post-and-readback → apply-layout (--hints) → assert-parity.
+
+## 11. Control-targeting standard + shared gate stack (2026-06-12 retrofit)
+
+Brought to the cross-plugin contract uniform across sigma-migration-skills' 8
+plugins. Vendored BYTE-IDENTICAL (md5 discipline): `scripts/lib/control_lint.rb`,
+`scripts/lib/layout_lint.rb`, `scripts/probe-controls.rb`,
+`scripts/assert-phase6-ran.rb`, `refs/control-parity.md`.
+
+**What the audit found** (gate 7 run against the §10 live Pilot Ops workbook):
+3 of 3 controls DEAD — Status (variable-tag: binding rejected by the org and
+stripped → decorative), Region (field-filter tag whose column isn't in the
+card's result set → never wired), Date Grain (parameter has zero
+parameter_mappings → filters nothing in Metabase either). Layout lint: clean
+(the §10d exact-grid round already passes; layouts unchanged by this retrofit).
+
+**What changed (reconciled with the §10d customer round, not clobbering it):**
+- Converter emits the `control-scope.json` sidecar (`--control-scope-out`):
+  `sourceFilterSignals` = MAPPED parameters; per-control `scope`/`mustReach`
+  from the declared `parameter_mappings` targets (Metabase targets are
+  explicit, like MSTR selectors — unmapped same-page cards are by-design).
+- ALL wirable mappings now wire as REAL control `filters` targets, replacing
+  the boolean match column `[Col] = [slug]` entirely: a list-control reference
+  inside a formula reads back as an error-typed column (live-caught by the
+  new gates on the first fixture build), and range semantics never fit an
+  equality anyway. Table dashcards are targeted directly; charts/KPIs/pivots
+  re-root through a hidden base TABLE on a trailing `Data` page (id prefixed
+  `data` — the layout-gate exemption convention), because control targets may
+  only point at table elements. Date params become date-range controls (flat
+  `mode:"between"` — datetime targets need it); list/segmented targets on
+  numeric/datetime columns bind through a hidden `Text()` cast column (the
+  silent-strip gotcha). remap-wb-to-dm-ids skips intra-workbook (base-table)
+  sources AND leaves `[controlId]` tokens unrepaired (rewriting `[region]` to
+  `[Customer Dim/Region]` made a filter always-true — also live-caught).
+- Controls are placed AFTER the elements they target in spec order.
+- Unmapped parameters and unwirable field-filters get NO control + a loud
+  warning (flag, never furniture — they do nothing in Metabase either /
+  cannot be honestly wired).
+- Variable-tag controls keep the §10d behavior (emit + `--dm-spec` binding);
+  NEW default when the org rejects the binding: post-and-readback DROPS those
+  controls (and patches the sidecar) instead of shipping decorative ones —
+  the customer's original complaint WAS "controls not driving anything".
+  `--keep-rejected-bindings` restores the strip-and-keep behavior (gate 7
+  will flag those dead until each is UI-synced to its DM parameter).
+- Sentinels: post-and-readback writes `wb-ids.json` + `posted-workbooks.jsonl`;
+  `assert-parity --check` writes `parity-final.json` (+ optional tile census);
+  post-and-readback and apply-layout run the shared lints inline;
+  `assert-phase6-ran.rb` (gates 1–7) is the GREEN gate.
+
+**Known limitation (deferred, needs an upstream standard change):** when an org
+ACCEPTS `control.parameters` DM bindings, the bound control is functional but
+spec-invisible to control_lint (the binding lives on the control element, which
+the lint doesn't treat as wiring) — gate 7 would false-positive it as dead.
+tj-wells-1989 currently rejects the binding, so this path is unexercised.
+
+**Bonus live finding (same retrofit, blocked the first fixture DM POST):**
+Sigma has NO `Or()`/`And()` FUNCTIONS — `Or(a, b)` is "Invalid formula" at
+POST; `and`/`or` are infix operators only. The MBQL translator now emits
+parenthesized infix chains (multi-value `=`, and/or/not nodes, is-empty/
+not-empty, inside). `Not()`, `Between()`, `IsNull()` are functions and fine.
