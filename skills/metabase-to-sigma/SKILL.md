@@ -147,6 +147,22 @@ node scripts/assert-parity.mjs --plan --type workbook --id <workbookId>   # emit
 node scripts/assert-parity.mjs --check --actual actual.json --expected metabase.json --tol 0.01
 ```
 
+**Expected values must be LIVE**: re-run the Metabase cards (`POST /api/card/{id}/query`)
+at verification time — a baseline captured earlier drifts as warehouse rows land, and
+the diff reads as a phantom parity failure.
+
+**Visual gate** (layout, control widgets, chart marks — things data queries can't see):
+export each page as PNG and LOOK at it:
+
+```bash
+# POST /v2/workbooks/{id}/export {"pageId":"<pageId>","format":{"type":"png","pixelWidth":1400}}
+# → {queryId} → poll GET /v2/query/{queryId}/download until 200 → PNG
+```
+
+Check: controls render as the right widget (segmented grain switcher, defaults filled),
+elements sit at the Metabase grid positions (not stacked), charts show marks (an empty
+chart with a title = a column/axis problem the readback scan can miss).
+
 A migration is **GREEN only when** (a) `assert-parity --check` passes AND (b) the
 workbook came back with a clean layout (`apply-layout.mjs` reported
 `layoutOnReadback: true`) — never on a 200 POST alone. `metabase.json` = the numbers
