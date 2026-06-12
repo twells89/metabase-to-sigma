@@ -14,9 +14,12 @@
  *                              waterfall → table element + LOUD warning (never fake a viz)
  *   text/heading dashcards   → text elements (markdown passes through)
  *   dashboard parameters     → workbook controls (controlId = parameter slug); each
- *                              parameter_mapping wires a hidden boolean match column
- *                              `[Target Col] = [slug]` + element filter values:[true]
- *                              (same control/filter pattern as cognos-report.ts)
+ *                              parameter_mapping wires a REAL control `filters` target
+ *                              on a TABLE element (the dashcard itself when it is a
+ *                              table, else a hidden base table the chart re-roots
+ *                              through — chart/KPI targets 400, and boolean-match
+ *                              columns referencing list controls error live). The
+ *                              control-scope.json sidecar carries declared scope.
  *
  * Element sources are PLACEHOLDERS: source { kind:'table', elementId: '<DM element NAME>' }.
  * The real Sigma element ids don't exist until the DM is POSTed —
@@ -39,7 +42,8 @@ import { normalizeCard, normalizeClause } from './pmbql-normalize.mjs';
 interface WbColumn { id: string; name: string; formula: string; format?: Record<string, any>; hidden?: boolean; }
 interface WbControl {
   id: string; kind: 'control'; controlId: string; name: string; controlType: string;
-  source?: Record<string, any>; value?: any;
+  source?: Record<string, any>; value?: any; values?: any[]; mode?: string;
+  filters?: Array<{ source: { kind: string; elementId: string }; columnId: string }>;
 }
 interface WbElement {
   id: string; kind: string; name?: string; source?: Record<string, any>;
@@ -58,11 +62,25 @@ export interface DashboardLayoutHint {
   grid: number;
   pages: Array<{ name: string; elements: Array<{ elementId: string; name: string; row: number; col: number; sizeX: number; sizeY: number }> }>;
 }
+/** control-scope.json sidecar (shared cross-plugin contract — see
+ *  scripts/lib/control_lint.rb header CONTRACT + refs/control-parity.md).
+ *  sourceFilterSignals = dashboard parameters with >=1 parameter_mapping
+ *  (Metabase parameters declare their card targets EXPLICITLY — an unmapped
+ *  parameter filters nothing in Metabase either, so it is not a signal).
+ *  Per-control `scope` = the converted element names of its mapped cards
+ *  (the declared-target allowlist); `mustReach` = the subset the converter
+ *  actually wired (hard assertions for the lint's closure walk). */
+export interface ControlScopeSidecar {
+  version: 1; source: 'metabase'; sourceFilterSignals: number;
+  controls: Array<{ controlId: string; sourceName?: string; scope: string[] | 'page'; mustReach: string[] }>;
+}
 export interface MetabaseDashboardResult {
   workbook: { name: string; schemaVersion: number; pages: WbPage[]; controls?: WbControl[] };
   warnings: string[];
   stats: Record<string, number>;
   layout: DashboardLayoutHint;
+  /** control-scope.json sidecar — write next to the workbook spec (cli --control-scope-out). */
+  controlScope: ControlScopeSidecar;
   /** dashboard-parameter → native-template-tag wirings (the dominant pattern on
    *  production estates: the parameter drives a {{tag}} in a card's SQL). The
    *  DM converter emits the matching {{tag}} control; these record which
@@ -122,13 +140,34 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
   }));
 
   // ── parameters → controls (controlId = slug; wiring below is per-mapping) ────
+  // Metabase parameters declare their card targets EXPLICITLY (per-dashcard
+  // parameter_mappings) — count mappings up front so (a) unmapped parameters
+  // are skipped (they filter nothing in Metabase either; porting one would
+  // ship furniture the control lint rightly rejects), and (b) range-typed
+  // mapped parameters get REAL control filter targets (below) instead of the
+  // boolean-equality formula, which is wrong for range semantics.
+  const mappingCountByParam = new Map<string, number>();
+  for (const dc of dcs) for (const pm of dc.parameterMappings) {
+    mappingCountByParam.set(pm.parameter_id, (mappingCountByParam.get(pm.parameter_id) || 0) + 1);
+  }
   const paramById = new Map<string, any>();
   const controls: WbControl[] = [];
+  const controlBySlug = new Map<string, WbControl>();
   for (const p of dash.parameters || []) {
     paramById.set(p.id, p);
-    const { type, warn } = controlTypeFor(p.type);
+    let { type, warn } = controlTypeFor(p.type);
     if (warn) warnings.push(`parameter "${p.name}" (${p.type}): ${warn}`);
     if (!type) continue;
+    if (!mappingCountByParam.get(p.id)) {
+      warnings.push(`parameter "${p.name}" (${p.type}) has NO parameter_mappings — it filters nothing in Metabase; no control emitted (flag, never furniture). Map it to a card in Metabase first if it should do something.`);
+      continue;
+    }
+    // Date parameters wired to dimension targets become date-RANGE controls:
+    // a scalar date control can only express equality, and the only verified
+    // Sigma wiring for a datetime target column is a date-range control with
+    // flat mode "between" (list/scalar targets on datetime columns are
+    // silently stripped at POST — see refs/control-parity.md).
+    if (type === 'date') type = 'date-range';
     const ctrl: any = {
       id: sigmaShortId(), kind: 'control', controlId: p.slug || p.id, name: p.name || p.slug,
       controlType: type,
@@ -151,11 +190,17 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
     if (ctrl.controlType === 'text') ctrl.mode = 'equals';
     if (ctrl.controlType === 'number') ctrl.mode = '=';
     if (ctrl.controlType === 'date') ctrl.mode = '=';
+    if (ctrl.controlType === 'date-range') ctrl.mode = 'between';
     // Defaults: list controls take `values` (array), everything else scalar `value`;
-    // never emit an explicit null.
+    // never emit an explicit null. Range controls: Metabase encodes defaults as
+    // relative tokens ("past30days") / "A~B" strings with no verified Sigma spec
+    // analog — dropped with a warning, set the default in the Sigma UI.
     if (p.default != null) {
-      if (ctrl.controlType === 'list') ctrl.values = Array.isArray(p.default) ? p.default : [p.default];
-      else {
+      if (ctrl.controlType === 'date-range' || ctrl.controlType === 'number-range') {
+        warnings.push(`parameter "${p.name}": range default ${JSON.stringify(p.default)} has no verified Sigma spec shape — control emitted WITHOUT a default; set it in the UI.`);
+      } else if (ctrl.controlType === 'list') {
+        ctrl.values = Array.isArray(p.default) ? p.default : [p.default];
+      } else {
         let v = Array.isArray(p.default) ? p.default[0] : p.default;
         // Metabase stores number defaults as strings ("20") — Sigma number controls want numbers.
         if (ctrl.controlType === 'number' && typeof v === 'string' && v.trim() !== '' && !isNaN(Number(v))) v = Number(v);
@@ -163,6 +208,7 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
       }
     }
     controls.push(ctrl);
+    controlBySlug.set(ctrl.controlId, ctrl);
   }
 
   // field-id → display name (metadata first; result_metadata fallback per card)
@@ -373,6 +419,29 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
   // dashboard-parameter → template-tag wirings (aggregated; see parameterWiring)
   const tagWirings: NonNullable<MetabaseDashboardResult['parameterWiring']> = [];
 
+  // ── control-scope bookkeeping (the sidecar contract) ─────────────────────────
+  // scope = converted element names of each control's MAPPED cards (declared
+  // targets); reach = the subset the converter actually wired (bool formula,
+  // range filter target, or field-filter recreation). dmBound = controls whose
+  // only wiring is the control→DM-parameter binding (remap --dm-spec).
+  const scopeBySlug = new Map<string, Set<string>>();
+  const reachBySlug = new Map<string, Set<string>>();
+  const dmBoundSlugs = new Set<string>();
+  const record = (m: Map<string, Set<string>>, slug: string, name?: string) => {
+    if (!name) return;
+    if (!m.has(slug)) m.set(slug, new Set());
+    m.get(slug)!.add(name);
+  };
+
+  // Hidden sourcing roots for range-control filter targets. A Sigma control's
+  // `filters` target may only point at a TABLE element (chart/KPI targets 400
+  // "Dependency not found") — so a range-mapped chart is re-rooted through a
+  // base table that sources the same DM element and carries the columns the
+  // chart (and the control target) needs. Base tables live on a final "Data"
+  // page whose id starts with "data" (the cross-plugin convention the layout
+  // gates use to exempt utility pages).
+  const baseTables: WbElement[] = [];
+
   // ── per-dashcard element builder ───────────────────────────────────────────
   const buildElement = (dc: (typeof dcs)[number]): WbElement | null => {
     const vs = dc.vs;
@@ -543,11 +612,28 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
       }
     }
 
-    // ── parameter_mappings → hidden boolean match column + element filter ─────
+    // ── parameter_mappings → control `filters` targets ─────────────────────────
+    // Every wirable mapping becomes a REAL control filter target — the verified
+    // cross-plugin wiring (refs/control-parity.md). A control reference inside a
+    // boolean match column (`[Col] = [slug]`) reads back as an error-typed
+    // column for list controls (live-caught 2026-06-12), so targets are the
+    // only honest form. Targets may only point at TABLE elements: a table
+    // dashcard is targeted directly; charts/KPIs re-root through a hidden base
+    // TABLE (collected in `pendingTargets`, materialized below). List/segmented
+    // targets on numeric or datetime columns are silently stripped at POST —
+    // those bind through a hidden Text() cast column (`cast`).
+    const pendingTargets: Array<{ slug: string; disp: string; fieldRef?: any; cast: boolean }> = [];
+    const NUMERIC_OR_DATETIME = /type\/(Integer|BigInteger|Float|Decimal|Number|DateTime|Date|Time)/;
+    const needsCast = (slug: string, baseType?: string) => {
+      const t = controlBySlug.get(slug)?.controlType;
+      return (t === 'list' || t === 'segmented' || t === 'text')
+        && !!baseType && NUMERIC_OR_DATETIME.test(baseType);
+    };
     for (const pm of dc.parameterMappings) {
       const p = paramById.get(pm.parameter_id);
       if (!p) { warnings.push(`card "${card.name}": parameter_mapping references unknown parameter ${pm.parameter_id} — skipped.`); continue; }
       const slug = p.slug || p.id;
+      record(scopeBySlug, slug, el.name);
       let tgt = pm.target;
       // pMBQL targets carry [op, {opts}, …] inner clauses — normalize them.
       if (Array.isArray(tgt) && tgt.length >= 2) tgt = [tgt[0], normalizeClause(tgt[1])];
@@ -559,6 +645,7 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
       if (innerTag && (tgt[0] === 'variable' || tgt[0] === 'dimension')) {
         if (tgt[0] === 'variable') {
           tagWirings.push({ parameter: p.name || slug, slug, card: card.name || String(card.id), tag: innerTag, kind: 'variable' });
+          dmBoundSlugs.add(slug);
           continue;
         }
         // dimension + template-tag = the parameter drives a FIELD FILTER tag.
@@ -570,9 +657,11 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
         const dimColId = Array.isArray(dimRef) ? resolveEntry(dimRef, built, ctx) : undefined;
         if (dimColId) {
           const targetCol = built.cols.find((c) => c.id === dimColId)!;
-          const boolId = sigmaShortId();
-          built.cols.push({ id: boolId, name: `${targetCol.name} = ${slug}`, formula: `[${targetCol.name}] = [${slug}]`, hidden: true });
-          (el.filters ||= []).push({ id: sigmaShortId(), columnId: boolId, kind: 'list', mode: 'include', values: [true] });
+          const fieldId = Array.isArray(dimRef) && typeof dimRef[1] === 'number' ? dimRef[1] : undefined;
+          const baseType = (fieldId != null && fidx?.byId.get(fieldId)?.baseType)
+            || (card.result_metadata || []).find((rm: any) => rm.name && built.byKey.get(String(rm.name).toLowerCase()) === dimColId)?.base_type;
+          pendingTargets.push({ slug, disp: targetCol.name, fieldRef: dimRef, cast: needsCast(slug, baseType) });
+          record(reachBySlug, slug, el.name);
         } else {
           warnings.push(`card "${card.name}": parameter "${p.name}" drives field-filter tag {{${innerTag}}} but the tag's column is not in the card's result set — add the column to the SQL SELECT, then filter it via the "${slug}" control.`);
         }
@@ -588,17 +677,10 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
       }
       const fieldRef = tgt[1];
       const disp = ctx.fieldDisplay(fieldRef);
-      let colId = resolveEntry(fieldRef, built, ctx);
-      if (!colId) {
-        colId = sigmaShortId();
-        const col: WbColumn = { id: colId, name: disp, formula: ctx.resolveField(fieldRef), hidden: true };
-        built.cols.push(col);
-        built.byKey.set(disp.toLowerCase(), colId);
-      }
-      const targetCol = built.cols.find((c) => c.id === colId)!;
-      const boolId = sigmaShortId();
-      built.cols.push({ id: boolId, name: `${targetCol.name} = ${slug}`, formula: `[${targetCol.name}] = [${slug}]`, hidden: true });
-      (el.filters ||= []).push({ id: sigmaShortId(), columnId: boolId, kind: 'list', mode: 'include', values: [true] });
+      const baseType = (typeof fieldRef?.[1] === 'number' ? fidx?.byId.get(fieldRef[1])?.baseType : undefined)
+        || (Array.isArray(fieldRef) && fieldRef[2]?.['base-type']) || undefined;
+      pendingTargets.push({ slug, disp, fieldRef, cast: needsCast(slug, baseType) });
+      record(reachBySlug, slug, el.name);
     }
 
     // card-level MBQL filter → hidden boolean column + element filter (element is card-specific here, so this is safe)
@@ -610,6 +692,103 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
       (el.filters ||= []).push({ id: sigmaShortId(), columnId: fid, kind: 'list', mode: 'include', values: [true] });
     }
 
+    // ── mapped targets → table element + control filter targets ────────────────
+    // A table dashcard is targeted DIRECTLY (it is already a table element); a
+    // chart/KPI/pivot re-roots through a hidden base TABLE (same DM source,
+    // passthrough columns) on the Data page — control targets may only point at
+    // table elements, and the element inherits the filter through the source
+    // closure. List/segmented targets on numeric/datetime columns bind through
+    // a hidden Text() cast column (silently stripped otherwise — verified).
+    if (pendingTargets.length) {
+      const isNative = card.dataset_query?.type === 'native';
+      let targetElId: string;
+      let targetCols: WbColumn[];        // column set on the TARGET table
+      let colByDisp: (disp: string) => WbColumn | undefined;
+
+      if (el.kind === 'table') {
+        // the dashcard is already a table — target it directly
+        targetElId = el.id;
+        targetCols = built.cols;
+        colByDisp = (disp) => {
+          let c = built.cols.find((cc) => cc.name === disp);
+          if (!c) {
+            const pt = pendingTargets.find((r) => r.disp === disp);
+            c = { id: sigmaShortId(), name: disp, formula: pt?.fieldRef ? ctx.resolveField(pt.fieldRef) : `[${disp}]`, hidden: true };
+            built.cols.push(c);
+            built.byKey.set(disp.toLowerCase(), c.id);
+          }
+          return c;
+        };
+      } else {
+        const baseName = `${card.name || `Card ${card.id}`} Base`;
+        // passthrough set: every source ref in the element's formulas + the targets.
+        // A "source ref" is a `[sourceName/X]`-prefixed token (MBQL cards) or, on
+        // native cards, a bare `[X]` that is either a passthrough column reading
+        // itself or a token that names no local column (a direct source read);
+        // bare refs to OTHER local columns and `[slug]` control refs stay local.
+        const needed = new Set<string>(pendingTargets.map((r) => r.disp));
+        const localNames = new Set(built.cols.map((cc) => cc.name));
+        const isPassthroughSelf = (c: WbColumn, tok: string) => c.name === tok && String(c.formula).trim() === `[${tok}]`;
+        const prefixed = new RegExp(`\\[${sourceName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/([^\\]]+)\\]`, 'g');
+        for (const c of built.cols) {
+          const f = String(c.formula || '');
+          if (isNative) {
+            for (const m of f.matchAll(/\[([^\]/]+)\]/g)) {
+              const tok = m[1];
+              if (controlBySlug.has(tok)) continue;
+              if (isPassthroughSelf(c, tok) || !localNames.has(tok)) needed.add(tok);
+            }
+          } else {
+            for (const m of f.matchAll(prefixed)) needed.add(m[1]);
+          }
+        }
+        const srcPrefix = isNative ? '' : `${sourceName}/`;
+        const baseCols: WbColumn[] = [...needed].map((n) => ({ id: sigmaShortId(), name: n, formula: `[${srcPrefix}${n}]` }));
+        const baseEl: WbElement = {
+          id: sigmaShortId(), kind: 'table', name: baseName,
+          source: { ...source }, columns: baseCols, order: baseCols.map((c) => c.id),
+        };
+        baseTables.push(baseEl);
+        // re-root the chart: source the base table, rewrite source refs through it
+        el.source = { kind: 'table', elementId: baseEl.id };
+        for (const c of built.cols) {
+          if (typeof c.formula !== 'string') continue;
+          if (isNative) {
+            const orig = c.formula;
+            c.formula = orig.replace(/\[([^\]/]+)\]/g, (whole, tok) => {
+              if (controlBySlug.has(tok)) return whole;
+              if (isPassthroughSelf(c, tok) || !localNames.has(tok)) return `[${baseName}/${tok}]`;
+              return whole;
+            });
+          } else {
+            c.formula = c.formula.split(`[${sourceName}/`).join(`[${baseName}/`);
+          }
+        }
+        targetElId = baseEl.id;
+        targetCols = baseCols;
+        colByDisp = (disp) => baseCols.find((c) => c.name === disp);
+      }
+
+      for (const pt of pendingTargets) {
+        const ctrl = controlBySlug.get(pt.slug);
+        const tc = colByDisp(pt.disp);
+        if (!ctrl || !tc) continue;
+        let columnId = tc.id;
+        if (pt.cast) {
+          // numeric/datetime list target — bind through a hidden Text() cast
+          let cast = targetCols.find((c) => c.name === `${pt.disp} (Text)`);
+          if (!cast) {
+            cast = { id: sigmaShortId(), name: `${pt.disp} (Text)`, formula: `Text([${pt.disp}])`, hidden: true };
+            targetCols.push(cast);
+            const holder = targetElId === el.id ? el : baseTables[baseTables.length - 1];
+            if (holder.order) holder.order.push(cast.id);
+          }
+          columnId = cast.id;
+        }
+        (ctrl.filters ||= []).push({ source: { kind: 'table', elementId: targetElId }, columnId });
+      }
+    }
+
     el.columns = built.cols;
     el.order = built.order;
     return el;
@@ -619,7 +798,7 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
   const tabs: any[] = dash.tabs?.length ? dash.tabs : [null];
   const pages: WbPage[] = [];
   const layout: DashboardLayoutHint = { grid: 24, pages: [] };
-  let placedControls = false;
+  const builtPages: Array<{ name: string; els: WbElement[] }> = [];
 
   for (const tab of tabs) {
     const pageName = tab ? (tab.name || `Tab ${tab.id}`) : 'Page 1';
@@ -634,11 +813,35 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
       els.push(el);
       hints.push({ elementId: el.id, name: el.name || el.kind, row: dc.row, col: dc.col, sizeX: dc.sizeX, sizeY: dc.sizeY });
     }
-    // controls live on the first page (dashboard filters are dashboard-global)
-    const pageEls: WbElement[] = !placedControls && controls.length ? [...(controls as any), ...els] : els;
-    if (!placedControls && controls.length) placedControls = true;
-    pages.push({ id: sigmaShortId(), name: pageName, elements: pageEls });
+    builtPages.push({ name: pageName, els });
     layout.pages.push({ name: pageName, elements: hints });
+  }
+
+  // Prune controls the converter KNOWS are furniture: no formula/filter wiring
+  // anywhere and no DM-binding path (variable-tag) either — e.g. a field-filter
+  // parameter whose column is missing from every mapped card's result set.
+  // Shipping one would fail the control lint (gate 7) by design; flag instead.
+  const liveControls = controls.filter((c) => {
+    const wired = reachBySlug.has(c.controlId) || (c.filters || []).length > 0 || dmBoundSlugs.has(c.controlId);
+    if (!wired) warnings.push(`control "${c.name}" [${c.controlId}] has no wirable target in any mapped card — control NOT emitted (it would be dead furniture; see the per-card warnings for the fix).`);
+    return wired;
+  });
+
+  // Assemble pages: controls live on the first page, AFTER the elements they
+  // target (a control whose `filters` target appears later in the spec fails
+  // at POST — verified cross-plugin gotcha, refs/control-parity.md).
+  let placedControls = false;
+  for (const bp of builtPages) {
+    const pageEls: WbElement[] = !placedControls && liveControls.length ? [...bp.els, ...(liveControls as any)] : bp.els;
+    if (!placedControls && liveControls.length) placedControls = true;
+    pages.push({ id: sigmaShortId(), name: bp.name, elements: pageEls });
+  }
+
+  // Hidden base-table sourcing roots live on a trailing "Data" page; its id
+  // starts with "data" — the cross-plugin convention layout gates use to
+  // exempt utility pages from dashboard-layout checks.
+  if (baseTables.length) {
+    pages.push({ id: `data${sigmaShortId()}`, name: 'Data', elements: baseTables });
   }
 
   // one aggregated warning per parameter that drives native template tags
@@ -652,7 +855,7 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
     }
   }
 
-  const allEls = pages.flatMap((p) => p.elements).filter((e) => e.kind !== 'control');
+  const allEls = pages.filter((p) => p.name !== 'Data').flatMap((p) => p.elements).filter((e) => e.kind !== 'control');
   const stats = {
     dashcards: dcs.length,
     pages: pages.length,
@@ -664,11 +867,31 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
     texts: allEls.filter((e) => e.kind === 'text').length,
     columns: allEls.reduce((n, e) => n + (e.columns?.length || 0), 0),
     filters: allEls.reduce((n, e) => n + (e.filters?.length || 0), 0),
-    controls: controls.length,
+    controls: liveControls.length,
+    baseTables: baseTables.length,
   };
+
+  // control-scope.json sidecar (shared cross-plugin contract — control_lint.rb
+  // header CONTRACT + refs/control-parity.md). Signals = mapped parameters;
+  // scope = each control's DECLARED card targets (converted element names);
+  // mustReach = the subset the converter actually wired. dm-bound controls
+  // (variable-tag → control.parameters via remap --dm-spec) carry their scope
+  // as declared intent — if the org rejects the binding, post-and-readback
+  // drops them and patches this sidecar (see scripts/post-and-readback.mjs).
+  const controlScope: ControlScopeSidecar = {
+    version: 1, source: 'metabase',
+    sourceFilterSignals: [...mappingCountByParam.keys()].filter((id) => paramById.has(id)).length,
+    controls: liveControls.map((c) => ({
+      controlId: c.controlId,
+      sourceName: `Metabase parameter "${c.name}"${dmBoundSlugs.has(c.controlId) ? ' (drives native {{tag}}s via DM-parameter binding)' : ''}`,
+      scope: [...(scopeBySlug.get(c.controlId) || [])],
+      mustReach: [...(reachBySlug.get(c.controlId) || [])],
+    })),
+  };
+
   return {
-    workbook: { name, schemaVersion: 1, pages, controls },
-    warnings, stats, layout,
+    workbook: { name, schemaVersion: 1, pages, controls: liveControls },
+    warnings, stats, layout, controlScope,
     ...(tagWirings.length ? { parameterWiring: tagWirings } : {}),
   };
 }

@@ -49,8 +49,8 @@ const nativeCard = read('top-customers-native.card.json');
     && joinEl?.source?.joins?.[0]?.columns?.[0]?.right === '[Customer Key]');
   check('dm', 'arithmetic expression: Net Amount = ([Sales Amount] - [Discount Amount])',
     col(joinEl, 'Net Amount')?.formula === '([Sales Amount] - [Discount Amount])');
-  check('dm', 'case → If, multi-value = → Or chain (no IsIn)',
-    col(joinEl, 'Tier Bucket')?.formula === 'If(Or([Loyalty Tier] = "GOLD", [Loyalty Tier] = "PLATINUM"), "Premium", "Standard")');
+  check('dm', 'case → If, multi-value = → infix or chain (no IsIn, no Or() function — live-verified)',
+    col(joinEl, 'Tier Bucket')?.formula === 'If(([Loyalty Tier] = "GOLD" or [Loyalty Tier] = "PLATINUM"), "Premium", "Standard")');
   check('dm', 'datetime-diff → DateDiff',
     col(orderFact, 'Days Since Order')?.formula === 'DateDiff("day", [Order Date], Now())');
   check('dm', 'breakout temporal-unit → DateTrunc calc column',
@@ -138,8 +138,9 @@ const nativeCard = read('top-customers-native.card.json');
   const byName = (n: string) => els.find((e) => e.name === n);
 
   check('wb', 'schemaVersion is 1', wb.schemaVersion === 1);
-  check('wb', 'one page per dashboard tab (Overview, Detail)',
-    wb.pages.length === 2 && wb.pages[0].name === 'Overview' && wb.pages[1].name === 'Detail');
+  check('wb', 'one page per dashboard tab (Overview, Detail) + trailing Data page for base tables',
+    wb.pages.length === 3 && wb.pages[0].name === 'Overview' && wb.pages[1].name === 'Detail'
+    && wb.pages[2].name === 'Data' && wb.pages[2].id.startsWith('data'));
   check('wb', 'text dashcard → text element with the markdown in body (live contract)',
     els.some((e) => e.kind === 'text' && /## Executive Overview/.test((e as any).body)));
   const kpi = byName('Total Revenue');
@@ -150,8 +151,14 @@ const nativeCard = read('top-customers-native.card.json');
   const line = byName('Revenue Trend');
   check('wb', 'line → line-chart with x dim + y metric matched through result_metadata',
     line?.kind === 'line-chart' && !!line.xAxis?.columnId && line.yAxis?.columnIds?.length === 1);
-  check('wb', 'line x column is the DateTrunc breakout against the DM element name',
-    line?.columns?.some((c: any) => c.formula === 'DateTrunc("month", [Order Fact/Order Date])'));
+  const lineBase = byName('Revenue Trend Base');
+  check('wb', 'range-mapped chart re-rooted through a base TABLE on the Data page (control targets need a table)',
+    lineBase?.kind === 'table' && lineBase?.source?.kind === 'data-model' && lineBase?.source?.elementId === 'Order Fact'
+    && wb.pages[2].elements.some((e: any) => e.id === lineBase.id)
+    && line?.source?.kind === 'table' && line?.source?.elementId === lineBase.id);
+  check('wb', 'line x column is the DateTrunc breakout rewritten through the base table',
+    line?.columns?.some((c: any) => c.formula === 'DateTrunc("month", [Revenue Trend Base/Order Date])')
+    && lineBase?.columns?.some((c: any) => c.name === 'Order Date' && c.formula === '[Order Fact/Order Date]'));
   const bar = byName('Customers by Region');
   check('wb', 'bar → bar-chart with orientation key OMITTED (vertical)',
     bar?.kind === 'bar-chart' && !('orientation' in bar));
@@ -176,16 +183,36 @@ const nativeCard = read('top-customers-native.card.json');
   check('wb', 'nested card MBQL filter → hidden bool column + element filter [true]',
     byName('Premium Orders')?.columns?.some((c: any) => c.hidden && c.formula === '[Orders Model/Tier Bucket] = "Premium"')
     && byName('Premium Orders')?.filters?.some((f: any) => f.kind === 'list' && f.mode === 'include' && f.values[0] === true));
-  check('wb', 'parameters → controls wired by slug (date/range → date-range, string/= → list)',
-    (wb.controls || []).some((c) => c.controlId === 'date_range' && c.controlType === 'date-range' && c.value === 'past30days')
+  const dateCtl = (wb.controls || []).find((c) => c.controlId === 'date_range');
+  check('wb', 'parameters → controls wired by slug (date/range → date-range mode "between", string/= → list)',
+    dateCtl?.controlType === 'date-range' && (dateCtl as any)?.mode === 'between'
     && (wb.controls || []).some((c) => c.controlId === 'region' && c.controlType === 'list'));
-  check('wb', 'parameter_mapping → hidden boolean match column + include-[true] filter',
-    bar?.columns?.some((c: any) => c.hidden && c.formula === '[Region] = [region]')
-    && bar?.filters?.some((f: any) => f.kind === 'list' && f.mode === 'include' && f.values[0] === true)
-    && line?.columns?.some((c: any) => c.hidden && c.formula === '[Order Date] = [date_range]'));
-  check('wb', 'element source placeholders are DM element NAMES on data-model sources (remap rewrites)',
-    line?.source?.kind === 'data-model' && line?.source?.elementId === 'Order Fact'
-    && bar?.source?.elementId === 'Customer Dim');
+  check('wb', 'relative range default dropped with a warning (no verified Sigma spec shape)',
+    dateCtl?.value === undefined && r.warnings.some((w) => /range default "past30days"/.test(w)));
+  const barBase = byName('Customers by Region Base');
+  const regionCtl = (wb.controls || []).find((c) => c.controlId === 'region') as any;
+  check('wb', 'list parameter_mapping → control `filters` target on the chart\'s base table (NO boolean match column — list-control formula refs error live)',
+    regionCtl?.filters?.length === 1
+    && regionCtl.filters[0].source?.kind === 'table'
+    && regionCtl.filters[0].source?.elementId === barBase?.id
+    && regionCtl.filters[0].columnId === barBase?.columns?.find((c: any) => c.name === 'Region')?.id
+    && !bar?.columns?.some((c: any) => /= \[region\]/.test(String(c.formula))));
+  check('wb', 'range parameter_mapping → control `filters` target on the base table column (not boolean equality)',
+    (dateCtl as any)?.filters?.length === 1
+    && (dateCtl as any).filters[0].source?.kind === 'table'
+    && (dateCtl as any).filters[0].source?.elementId === lineBase?.id
+    && (dateCtl as any).filters[0].columnId === lineBase?.columns?.find((c: any) => c.name === 'Order Date')?.id
+    && !line?.columns?.some((c: any) => /= \[date_range\]/.test(String(c.formula))));
+  check('wb', 'element source placeholders are DM element NAMES on data-model sources (remap rewrites); mapped charts re-root through their base',
+    row?.source?.kind === 'data-model' && row?.source?.elementId === 'Customer Dim'
+    && bar?.source?.kind === 'table' && bar?.source?.elementId === barBase?.id);
+  check('wb', 'controls placed AFTER the elements they target in spec order (POST rejects forward targets)',
+    (() => { const kinds = wb.pages[0].elements.map((e: any) => e.kind); return kinds.lastIndexOf('control') === kinds.length - 1 && kinds.indexOf('control') > kinds.findIndex((k: string) => k !== 'control'); })());
+  check('wb', 'control-scope sidecar: signals = mapped params; scope/mustReach = declared targets',
+    r.controlScope.sourceFilterSignals === 2
+    && r.controlScope.controls.length === 2
+    && JSON.stringify(r.controlScope.controls.find((c) => c.controlId === 'date_range')?.scope) === '["Revenue Trend"]'
+    && JSON.stringify(r.controlScope.controls.find((c) => c.controlId === 'region')?.mustReach) === '["Customers by Region"]');
   check('wb', 'layout hints preserve the 1:1 24-col grid',
     r.layout.grid === 24
     && r.layout.pages[0].elements.some((h) => h.name === 'Revenue Trend' && h.col === 5 && h.sizeX === 10 && h.sizeY === 6));
@@ -233,7 +260,7 @@ const nativeCard = read('top-customers-native.card.json');
   check('pmbql', 'opts-second temporal-unit breakout → DateTrunc week calc',
     of?.columns?.some((c: any) => c.name === 'Order Date (Week)' && c.formula === 'DateTrunc("week", [Order Date])'));
   check('pmbql', 'filters array AND-merged; pMBQL "in" → Or chain (warned on the shared element)',
-    r.warnings.some((w) => /Or\(\[Order Number\] = 100, \[Order Number\] = 200\)/.test(w))
+    r.warnings.some((w) => /\(\[Order Number\] = 100 or \[Order Number\] = 200\)/.test(w))
     && r.warnings.some((w) => /\[Order Date\] >= DateAdd\("month", -6, Today\(\)\)/.test(w)));
   const joinEl = els.find((e) => e.name === 'Orders with Customers (pMBQL Join)');
   check('pmbql', 'pMBQL join {stages, conditions} → join source on Customer Key (live shape)',
@@ -277,9 +304,19 @@ const nativeCard = read('top-customers-native.card.json');
     && (r.parameterWiring || []).some((w) => w.slug === 'order_date_param' && w.tag === 'order_date' && w.kind === 'field-filter'));
   check('pmbql-wb', 'tag wiring warnings AGGREGATED (one per parameter, not per mapping)',
     r.warnings.filter((w) => /drives native template tag/.test(w)).length === 2);
-  check('pmbql-wb', 'pMBQL dimension target (opts-second field) → hidden bool + include-[true] filter',
-    bar?.columns?.some((c: any) => c.hidden && /= \[order_window\]$/.test(c.formula))
-    && bar?.filters?.some((f: any) => f.kind === 'list' && f.values?.[0] === true));
+  const barBase = els.find((e) => e.name === 'Weekly Orders by Region (pMBQL) Base');
+  const owCtl = (r.workbook.controls || []).find((c) => c.controlId === 'order_window') as any;
+  check('pmbql-wb', 'pMBQL dimension target (opts-second field) on a date/range param → base-table control filter target',
+    barBase?.kind === 'table'
+    && bar?.source?.elementId === barBase?.id
+    && owCtl?.filters?.[0]?.source?.elementId === barBase?.id
+    && !bar?.columns?.some((c: any) => /= \[order_window\]$/.test(String(c.formula))));
+  check('pmbql-wb', 'unwirable field-filter control NOT emitted (column missing from every mapped result set)',
+    !(r.workbook.controls || []).some((c) => c.controlId === 'order_date_param')
+    && r.warnings.some((w) => /order_date_param.*NOT emitted|control "Order Date".*NOT emitted/i.test(w)));
+  check('pmbql-wb', 'variable-tag control kept (DM-binding path) and recorded in the sidecar as dm-bound',
+    (r.workbook.controls || []).some((c) => c.controlId === 'region_param')
+    && /DM-parameter binding/.test(r.controlScope.controls.find((c) => c.controlId === 'region_param')?.sourceName || ''));
   check('pmbql-wb', 'table.column_formatting single rule → conditionalFormats; range rule flagged',
     table?.conditionalFormats?.length === 1
     && table.conditionalFormats[0].condition === '>'
@@ -293,6 +330,18 @@ const nativeCard = read('top-customers-native.card.json');
     && r.warnings.some((w) => /object DETAIL view/.test(w)));
   check('pmbql-wb', 'virtual text card still passes markdown through (body field)',
     els.some((e) => e.kind === 'text' && /## Ops Notes/.test((e as any).body)));
+}
+
+// ── control-targeting: unmapped parameters are furniture in Metabase too ─────
+{
+  const d = read('exec-overview.dashboard.json');
+  d.parameters = [...(d.parameters || []), { id: 'pX', name: 'Orphan Filter', slug: 'orphan', type: 'string/=' }];
+  const r = convertMetabaseDashboardToSigma(d, { metadata, cardNameById: { 100: 'Orders Model' } });
+  check('scope', 'parameter with zero parameter_mappings → NO control + loud warning',
+    !(r.workbook.controls || []).some((c) => c.controlId === 'orphan')
+    && r.warnings.some((w) => /"Orphan Filter".*NO parameter_mappings/.test(w)));
+  check('scope', 'unmapped parameter not counted in sourceFilterSignals',
+    r.controlScope.sourceFilterSignals === 2);
 }
 
 // ── BigQuery estate: paths/casing/dialect (Sigma side LIVE-verified 2026-06-11

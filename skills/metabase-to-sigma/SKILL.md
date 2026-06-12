@@ -36,8 +36,11 @@ viz, click behaviors) instead of emitting wrong logic.
 > decisions + production findings), `rest-api.md` (endpoints + auth + version
 > gotchas), `mbql-shapes.md` (real card/dashboard JSON structures incl. pMBQL),
 > `expression-dsl.md` (MBQL → Sigma formula mapping table), `template-tags.md`
-> (native {{tags}} → Sigma controls). For canonical Sigma data-model + workbook
-> spec shapes, defer to the companion `sigma-data-models` / `sigma-workbooks` skills.
+> (native {{tags}} → Sigma controls), `control-parity.md` (SHARED cross-plugin
+> control-wiring contract: the control lint, the control-scope.json sidecar, the
+> flip test, and the verified target gotchas). For canonical Sigma data-model +
+> workbook spec shapes, defer to the companion `sigma-data-models` /
+> `sigma-workbooks` skills.
 
 ---
 
@@ -127,7 +130,8 @@ non-zero exit.
 ## Phase 3 — Convert the dashboard → Sigma workbook, wired to the DM
 
 ```bash
-node --import tsx/esm cli.ts ../exec.dashboard.json --metadata ../metadata.json --dm <dataModelId> --layout-out hints.json > wb.json
+node --import tsx/esm cli.ts ../exec.dashboard.json --metadata ../metadata.json --dm <dataModelId> \
+  --layout-out hints.json --control-scope-out control-scope.json > wb.json
 node scripts/remap-wb-to-dm-ids.mjs --wb wb.json --dm-id <dataModelId> --dm-spec dm.json --out wb.remapped.json
 node scripts/post-and-readback.mjs --type workbook --spec wb.remapped.json --folder <folderId>
 node scripts/apply-layout.mjs --workbook <workbookId> --hints hints.json
@@ -139,25 +143,70 @@ funnel/gauge/progress/waterfall → flagged tables). The converter emits each el
 `source.elementId` as the source card/table **name** (a placeholder) —
 `remap-wb-to-dm-ids.mjs` rewrites those to real ids from Phase 2's readback (native
 cards all read back "Custom SQL", so it falls back to column-set fingerprints and
-repairs every formula ref against the live DM columns). Dashboard **parameters**
-become Sigma controls wired by controlId (static-list params → segmented controls
-with values + defaults); `--dm-spec` additionally emits control→DM-parameter
-bindings — if the org rejects them, post-and-readback strips and warns: sync those
-controls in the UI. Metabase's 24-col dashcard grid maps 1:1 onto Sigma's layout —
-`apply-layout.mjs --hints` reproduces the exact geometry and confirms it survives
-readback (without `--hints` it falls back to a clean generic layout).
+repairs every formula ref against the live DM columns).
 
-## Phase 4 — Verify parity (hard gate — the real proof)
+**Controls** (full contract: `refs/control-parity.md`). Metabase dashboard parameters
+declare their card targets explicitly (`parameter_mappings`) — the converter wires
+each mapping and emits the **`control-scope.json` sidecar** (`--control-scope-out`,
+keep it next to the workbook spec: post-and-readback and gate 7 pick it up there):
+
+- **scalar params** (string/number equality, incl. static-list → segmented grain
+  switchers with values + defaults) → hidden boolean `[Col] = [slug]` + element filter;
+- **range params** (`date/*` → date-range with flat `mode: "between"`,
+  `number/between` → number-range) → REAL control `filters` targets, re-rooted
+  through a hidden **base table** on a trailing `Data` page (control targets may
+  only point at table elements; list/scalar targets on datetime columns are
+  silently stripped — both verified cross-plugin gotchas);
+- **variable-tag params** (drive `{{tags}}` in card SQL) → `--dm-spec` emits
+  control→DM-parameter bindings; if the org rejects them, post-and-readback
+  **drops those controls** (decorative controls are exactly what gate 7 blocks —
+  the DM `{{tag}}` controls still carry the filter; sync a workbook control in
+  the UI when the org enables DM-parameter targeting, or pass
+  `--keep-rejected-bindings` to keep them and sync by hand);
+- **unmapped params + unwirable field-filters** → NO control, loud warning
+  (flag, never furniture).
+
+post-and-readback (workbook) finishes by running the SHARED layout + control lints
+on the readback spec — fix violations (repair recipes in `refs/control-parity.md`)
+or annotate genuine narrow intent in `control-scope.json` before moving on.
+Metabase's 24-col dashcard grid maps 1:1 onto Sigma's layout —
+`apply-layout.mjs --hints` reproduces the exact geometry, confirms it survives
+readback, and re-runs the layout lint (without `--hints` it falls back to a clean
+generic layout).
+
+## Phase 4 — Verify parity + the seven gates (hard gate — the real proof)
 
 ```bash
 node scripts/assert-parity.mjs --plan --type workbook --id <workbookId>   # emits per-element SQL
 # run each via mcp-v2 query (or the Sigma query API), save totals to actual.json
-node scripts/assert-parity.mjs --check --actual actual.json --expected metabase.json --tol 0.01
+node scripts/assert-parity.mjs --check --actual actual.json --expected metabase.json --tol 0.01 \
+  --workdir <workdir>  --census '{"zones_total":N,"charts_built":M,"zones_unmatched":0,"unmatched_zone_names":[]}'
+ruby scripts/assert-phase6-ran.rb --workdir <workdir> --workbook-id <workbookId>   # gates 1–7
 ```
 
 **Expected values must be LIVE**: re-run the Metabase cards (`POST /api/card/{id}/query`)
 at verification time — a baseline captured earlier drifts as warehouse rows land, and
 the diff reads as a phantom parity failure.
+
+`assert-parity --check` writes the `parity-final.json` sentinel into `--workdir`
+(post-and-readback already wrote `wb-ids.json` + `posted-workbooks.jsonl` there);
+derive the `--census` counts from the converter stats (dashcards converted vs
+elements built — name any legitimately unbuildable zones). Then
+**`assert-phase6-ran.rb` is the GREEN gate**: parity ran (1), no orphan workbooks
+(2), no error-typed columns (3), layout applied (4), tile census (5), layout lint
+(6), control lint honoring `control-scope.json` (7). Exit 0 or it isn't done.
+
+**Flip test** (runtime control evidence — REQUIRED after any hand-repaired wiring,
+recommended always; see `refs/control-parity.md` for why MCP cannot do this):
+
+```bash
+ruby scripts/probe-controls.rb --workbook-id <workbookId> --check-out-of-closure
+# date-range / number-range controls need an explicit flip value:
+#   --value <controlId>='min:2026-01-01,max:2026-03-31'
+```
+
+A mapped card's export must CHANGE under `parameters:{<controlId>: <value>}`; an
+unmapped same-page card must NOT (no leak).
 
 **Visual gate** (layout, control widgets, chart marks — things data queries can't see):
 export each page as PNG and LOOK at it:
@@ -171,7 +220,8 @@ Check: controls render as the right widget (segmented grain switcher, defaults f
 elements sit at the Metabase grid positions (not stacked), charts show marks (an empty
 chart with a title = a column/axis problem the readback scan can miss).
 
-A migration is **GREEN only when** (a) `assert-parity --check` passes AND (b) the
+A migration is **GREEN only when** (a) `assert-parity --check` passes, (b)
+`assert-phase6-ran.rb` exits 0 (all seven gates, control lint included), AND (c) the
 workbook came back with a clean layout (`apply-layout.mjs` reported
 `layoutOnReadback: true`) — never on a 200 POST alone. `metabase.json` = the numbers
 from the Metabase cards (run each card via `POST /api/card/{id}/query` — the one
