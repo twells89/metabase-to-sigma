@@ -17,12 +17,20 @@ Convert Metabase **models + questions** into a Sigma **data model**, then conver
 cleanly; **flag what doesn't** (cum-sum/offset windows, saved segment refs, funnel/gauge
 viz, click behaviors) instead of emitting wrong logic.
 
-> **Status: extraction side production-validated** against a live 7k-card / 1.5k-
-> dashboard Metabase Cloud estate (v1.61.4 — 100% pMBQL); the normalizer,
-> template-tag handling, and field-id fallback chain come from that contact
-> (`refs/design-notes.md` §9). **The Sigma BUILD path (POST DM + workbook) is
-> still fixture-validated only — no end-to-end parity migration yet.** On your
-> first live POST, diff real payloads against `refs/` and fix drift there first.
+> **Status: production-validated end to end.** Extraction proven against a live
+> 7k-card / 1.5k-dashboard Metabase Cloud estate (v1.61.4 — 100% pMBQL); the
+> Sigma BUILD path live-validated with exact MCP-query parity, including models,
+> nested questions, combo charts, controls, and exact-grid layout
+> (`refs/design-notes.md` §9–§10d). BigQuery paths/casing are live-verified on
+> the Sigma side (§10c).
+
+> **This skill is customizable in plain language.** Read
+> `~/.metabase-to-sigma/preferences.md` if it exists at the start of every run,
+> restate the active preferences briefly, and honor them throughout (they may
+> override any default EXCEPT the verification gates). When the user corrects an
+> output or states a preference mid-run, OFFER to persist it — see
+> `refs/customization.md` for the three tiers (preferences / learned formula
+> rules / converter changes).
 
 > Read `refs/` before relying on shapes: `design-notes.md` (translation surface +
 > decisions + production findings), `rest-api.md` (endpoints + auth + version
@@ -253,3 +261,19 @@ a Sigma formula, validates it against the customer's live Sigma via
 `~/.metabase-to-sigma/learned-rules.json` — which the converter CLI auto-applies
 *before* the built-in translator on the next run. If no formula validates, it returns
 an opt-in `scripts/escalate-gap.py` command to file a tracking issue (ask first).
+
+## Customizing the skill (your org, your rules)
+
+Everything above is the default behavior — not the required one. Tell Claude what
+you want different, in plain language, and ask it to remember:
+
+- **Run preferences** (naming, folders, which tabs/cards, control widget choices,
+  layout taste) → saved to `~/.metabase-to-sigma/preferences.md`, read at the start
+  of every run.
+- **Formula translations** specific to your SQL idioms → learned rules
+  (`~/.metabase-to-sigma/learned-rules.json`), validated live before persisting.
+- **Structural behavior** (chart mappings, DM shape) → converter changes with
+  fixture tests; share fixes back via `scripts/escalate-gap.py` or a PR.
+
+Both home-dir files survive `git pull`. Full guide + worked examples:
+`refs/customization.md`.
