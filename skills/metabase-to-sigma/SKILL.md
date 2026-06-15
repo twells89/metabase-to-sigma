@@ -113,6 +113,16 @@ ruby scripts/find-or-pick-dm.rb --workbook-signature dm-signature.json \
   `recommended_dm_id`.
 - **Score < 0.6** → POST new (Phase 2) and TELL the user no reusable DM was found.
 
+## Phase 1.9 — Choose where to build (ask first when no destination given)
+
+Don't pick the destination for the user. If they didn't supply a `--folder <id>`, ASK before the Phase 2 POST:
+
+1. `node scripts/pick-destination.mjs list` → `{ workspaces, folders (editable, with parentName), myDocuments }`
+2. Let the user pick ONE: a **workspace** (its `id` lands content in the workspace root), an existing **folder**, **My Documents** (when non-null — null for service tokens), or **create a new folder**: `node scripts/pick-destination.mjs create --name "<name>" [--parent <workspace-or-folder-id>]`
+3. Pass the chosen id as `--folder <id>` to every `post-and-readback.mjs` call (DM + workbook). `folderId` accepts a workspace id or a folder id.
+
+If a destination is already supplied, honor it silently — don't ask.
+
 ## Phase 2 — POST the data model + read back ids (hard gate)
 
 ```bash
@@ -133,9 +143,12 @@ non-zero exit.
 node --import tsx/esm cli.ts ../exec.dashboard.json --metadata ../metadata.json --dm <dataModelId> \
   --layout-out hints.json --control-scope-out control-scope.json > wb.json
 node scripts/remap-wb-to-dm-ids.mjs --wb wb.json --dm-id <dataModelId> --dm-spec dm.json --out wb.remapped.json
+ruby scripts/lib/preflight_lint.rb wb.remapped.json   # MANDATORY — fix all violations before POST
 node scripts/post-and-readback.mjs --type workbook --spec wb.remapped.json --folder <folderId>
 node scripts/apply-layout.mjs --workbook <workbookId> --hints hints.json
 ```
+
+**Preflight (mandatory):** `ruby scripts/lib/preflight_lint.rb wb.remapped.json` exits 1 with a precise message on the two migration-killer bugs — a `table` with aggregate columns + dimensions but **no `groupings`** (renders raw detail rows instead of an aggregated summary), and a malformed `control` (missing `id`/`controlId`/`controlType` or the flat list value fields `source`/`mode`/`selectionMode`/`values`). Fix every violation first; **never conclude a feature is "unsupported" from an `Invalid kind` error** — it means the inner fields are wrong. Verified shapes: `sigma-workbooks` `controls.md`/`tables.md`.
 
 Each dashcard becomes the matching Sigma element sourced from the migrated DM element
 (KPI/bar/line/area/pie/combo/scatter/table/pivot/map; text cards → text elements;
