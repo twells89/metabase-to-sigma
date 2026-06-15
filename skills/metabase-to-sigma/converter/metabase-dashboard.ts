@@ -33,7 +33,7 @@
  */
 
 import { resetIds, sigmaShortId, sigmaDisplayName, formatFromMask } from './sigma-ids.js';
-import { buildFieldIndex, translateMbqlExpr, translateAggregation, type FieldIndex, type MbqlCtx, type LearnedRule } from './metabase.js';
+import { buildFieldIndex, recognizeSimpleNativeSql, translateMbqlExpr, translateAggregation, type FieldIndex, type MbqlCtx, type LearnedRule } from './metabase.js';
 // pMBQL → legacy at intake: embedded dashcard cards AND parameter_mapping
 // targets arrive in pMBQL form on modern instances (Cloud v1.61+).
 import { normalizeCard, normalizeClause } from './pmbql-normalize.mjs';
@@ -138,6 +138,26 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
     sizeX: d.size_x ?? d.sizeX ?? 4, sizeY: d.size_y ?? d.sizeY ?? 4,
     parameterMappings: d.parameter_mappings || [],
   }));
+
+  // Simple native-SQL cards are auto-remodeled to a NATIVE Sigma data model (see
+  // recognizeSimpleNativeSql) so their columns are exposed and dashboard filters
+  // reproduce natively. Mirror that here: swap the card to its structured form
+  // (+ the alias-aligned result_metadata so the viz keeps its axes) and rewrite
+  // each field-filter template-tag mapping to a raw dimension target — which the
+  // proven MBQL dimension-wiring path below turns into a control + element filter.
+  for (const dc of dcs) {
+    if (!dc.card || dc.card.dataset_query?.type !== 'native') continue;
+    const remodeled = recognizeSimpleNativeSql(dc.card, fidx);
+    if (!remodeled) continue;
+    const tags = dc.card.dataset_query?.native?.['template-tags'] || {};
+    dc.card = { ...dc.card, dataset_query: { type: 'query', database: dc.card.dataset_query.database, query: remodeled.query }, result_metadata: remodeled.resultMetadata };
+    dc.parameterMappings = dc.parameterMappings.map((pm: any) => {
+      const tgt = pm.target;
+      const tag = Array.isArray(tgt) && Array.isArray(tgt[1]) && tgt[1][0] === 'template-tag' ? String(tgt[1][1]) : null;
+      const dim = tag && tags[tag]?.type === 'dimension' ? tags[tag].dimension : null;
+      return dim ? { ...pm, target: ['dimension', dim] } : pm;
+    });
+  }
 
   // ── parameters → controls (controlId = slug; wiring below is per-mapping) ────
   // Metabase parameters declare their card targets EXPLICITLY (per-dashcard
@@ -817,14 +837,38 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
     layout.pages.push({ name: pageName, elements: hints });
   }
 
-  // Prune controls the converter KNOWS are furniture: no formula/filter wiring
-  // anywhere and no DM-binding path (variable-tag) either — e.g. a field-filter
-  // parameter whose column is missing from every mapped card's result set.
-  // Shipping one would fail the control lint (gate 7) by design; flag instead.
+  // Prune controls the converter KNOWS are furniture. A control is only LIVE if
+  // it has a real Sigma wiring path: a formula reference (reachBySlug) or an
+  // element `filters` target. Two failure modes are flagged, never shipped:
+  //   1. field-filter parameters whose column is missing from every mapped
+  //      card's result set (no target to bind).
+  //   2. variable-tag parameters that only drive a DM-SQL {{tag}} (dmBoundSlugs).
+  //      LIVE-DISPROVEN 2026-06-15 on tj-wells-1989: a workbook control bound
+  //      only to a DM custom-SQL {{param}} is INERT — the export API ignores a
+  //      text grain control entirely and a numeric one mis-substitutes and
+  //      breaks the query (0 rows). The control lint rightly flags these dead.
+  //      So they are NOT emitted; they go into `unreproducibleFilters` with a
+  //      manual-remodel hint instead of shipping furniture that lies.
+  const unreproducibleFilters: Array<{ controlId: string; name: string; reason: string; hint: string }> = [];
   const liveControls = controls.filter((c) => {
-    const wired = reachBySlug.has(c.controlId) || (c.filters || []).length > 0 || dmBoundSlugs.has(c.controlId);
-    if (!wired) warnings.push(`control "${c.name}" [${c.controlId}] has no wirable target in any mapped card — control NOT emitted (it would be dead furniture; see the per-card warnings for the fix).`);
-    return wired;
+    const wired = reachBySlug.has(c.controlId) || (c.filters || []).length > 0;
+    if (wired) return true;
+    if (dmBoundSlugs.has(c.controlId)) {
+      unreproducibleFilters.push({
+        controlId: c.controlId, name: c.name,
+        reason: 'drives a native {{tag}} consumed pre-aggregation inside custom SQL — a workbook control bound to a DM-SQL parameter is inert (live-disproven)',
+        hint: 'rebuild as a native Sigma control: surface the underlying column/date in the element and filter/group on it (date-trunc control for granularity, relative-date filter for a window, list control for a value), or sync this control to the DM parameter in the Sigma UI.',
+      });
+      warnings.push(`control "${c.name}" [${c.controlId}] only drives a DM custom-SQL {{tag}} — NOT emitted (a workbook control bound to a DM-SQL parameter is inert, live-disproven). Listed in unreproducibleFilters with a remodel hint.`);
+    } else {
+      unreproducibleFilters.push({
+        controlId: c.controlId, name: c.name,
+        reason: 'its mapped column is not in any consuming element\'s result set (consumed then aggregated away inside SQL)',
+        hint: 'add the column to the card\'s SELECT (and GROUP BY) so it lands in the result set, then this control binds as an element filter automatically.',
+      });
+      warnings.push(`control "${c.name}" [${c.controlId}] has no wirable target in any mapped card — control NOT emitted (it would be dead furniture; see the per-card warnings for the fix).`);
+    }
+    return false;
   });
 
   // Assemble pages: controls live on the first page, AFTER the elements they
@@ -893,5 +937,6 @@ export function convertMetabaseDashboardToSigma(dashboard: any, options: Metabas
     workbook: { name, schemaVersion: 1, pages, controls: liveControls },
     warnings, stats, layout, controlScope,
     ...(tagWirings.length ? { parameterWiring: tagWirings } : {}),
+    ...(unreproducibleFilters.length ? { unreproducibleFilters } : {}),
   };
 }
