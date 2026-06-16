@@ -6,9 +6,33 @@ Metabase Cloud v1.61) carry at least one tag. Tag-type distribution observed
 there: text 5,629 · date 2,364 · dimension (field filter) 1,914 · number 1,002 ·
 card 384 · boolean 47.
 
-The key fact that makes this conversion clean: **Sigma custom SQL uses the
-same `{{control-id}}` parameter syntax as Metabase**. A plain variable tag's
-SQL needs NO rewrite — only a matching control.
+> ## ⚠️ 2026-06-15 — PREFER native-model remodel; custom-SQL control binding is INERT
+>
+> **Live-disproven (tj-wells-1989):** a *workbook* control bound only to a DM
+> custom-SQL `{{param}}` does NOT filter — a text grain control is ignored and a
+> numeric one mis-substitutes and breaks the query (0 rows). So the
+> `{{tag}}`-kept-verbatim path below only works when the user manually wires the
+> control to the DM parameter in the Sigma UI. Two consequences in the converter:
+>
+> 1. **Simple native SQL is auto-remodeled to a NATIVE Sigma data model** — a
+>    card that is a single `SELECT` over warehouse table(s) (no CTE / subquery /
+>    CASE / window / set-op, only field-filter tags, real WHERE only on those
+>    tags) is re-expressed as a structured query and built as a table/join model
+>    (no custom SQL). Its columns are exposed, so field filters reproduce as REAL
+>    Sigma controls + element filters that actually filter — verified live (a
+>    `last_name` control flips a chart 5→1 rows). This is the path to working
+>    filters; **the mapping table below is the FALLBACK for SQL too complex to
+>    remodel.**
+> 2. **No dead furniture:** a control whose only wiring would be a DM-SQL
+>    `{{param}}` (or a field-filter column missing from the result set) is NOT
+>    emitted — it goes into the result's `unreproducibleFilters` report
+>    (controlId / name / reason / hint) so the migration surfaces exactly what
+>    still needs a manual remodel. See design-notes.md "native-model remodel".
+
+The fact behind the fallback path: **Sigma custom SQL uses the same
+`{{control-id}}` parameter syntax as Metabase**, so a plain variable tag's SQL
+needs NO rewrite — but per the warning above, that control must be wired to the
+DM parameter in the UI to actually filter.
 
 ## Mapping table
 

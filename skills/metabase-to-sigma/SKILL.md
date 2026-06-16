@@ -258,15 +258,22 @@ production-validated, Sigma POST shapes pending first live build):**
   `share` → ratio + `%` format), temporal-unit breakouts → `DateTrunc` columns.
 - **FK metadata → DM relationships** (+ derived join view; the relationship's own key
   column is skipped — a cross-element join-key passthrough compiles to type `error`).
-- **Native SQL questions** → Custom SQL elements (no element name, bare `[Display Name]`
-  refs); the dialect passes through verbatim (same-warehouse migrations — e.g.
-  BigQuery `project.dataset.table` refs — are near-verbatim). Plain
-  `{{text/number/date/boolean}}` template tags keep their `{{tag}}` (Sigma custom SQL
-  uses the SAME syntax) and emit matching controls; **field-filter (dimension) tags**
-  are neutralized to `1=1` + recreated as control + element filter; `{{#card}}` tags
-  are inlined when the referenced card is a tag-free native card in the input set;
-  optional `[[…]]` blocks are kept-active or dropped per Metabase's empty-value
-  semantics (always warned). See `refs/template-tags.md`.
+- **Native SQL questions** → first the converter tries to **auto-remodel to a NATIVE
+  Sigma data model**: a card that is a single `SELECT` over warehouse table(s) (no
+  CTE / subquery / CASE / window / set-op, only field-filter tags, real WHERE only on
+  those tags, no LIMIT) is re-expressed as a structured query and built as a
+  table/join model — NO custom SQL — so its columns are exposed and dashboard filters
+  reproduce as REAL Sigma controls + element filters (live-proven). SQL too complex to
+  remodel **falls back to a Custom SQL element** (no element name, bare `[Display Name]`
+  refs; dialect verbatim — BigQuery `project.dataset.table` near-verbatim). In the
+  fallback: plain `{{text/number/date/boolean}}` tags keep their `{{tag}}` + emit a
+  control (⚠️ a workbook control bound only to a DM-SQL `{{param}}` is INERT until
+  wired to the DM parameter in the UI — live-disproven); **field-filter tags** →
+  `1=1` + recreated as control/element filter when the column is in the result set;
+  `{{#card}}` inlined when tag-free; `[[…]]` kept/dropped per Metabase semantics
+  (always warned). Filters that can't be reproduced are reported in the result's
+  **`unreproducibleFilters`** (reason + manual-remodel hint) — never shipped as dead
+  controls. See `refs/template-tags.md`.
 - **Dashboards** → workbooks: one page per tab, 24-col grid 1:1, scalar/smartscalar →
   KPI (`value: {columnId}`), pivot → pivot-table (`rowsBy`/`columnsBy` `{id}` objects +
   bare-string `values`), `row` display → horizontal bar, maps → region-/point-map,

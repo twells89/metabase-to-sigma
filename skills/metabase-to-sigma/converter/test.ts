@@ -2,7 +2,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { convertMetabaseToSigma } from './metabase.js';
+import { convertMetabaseToSigma, recognizeSimpleNativeSql, buildFieldIndex } from './metabase.js';
 import { convertMetabaseDashboardToSigma } from './metabase-dashboard.js';
 
 const FIX = join(dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
@@ -239,7 +239,11 @@ const nativeCard = read('top-customers-native.card.json');
   const els = r.model.pages[0].elements as any[];
   const sqlEls = els.filter((e) => e.source?.kind === 'sql');
   const ctrl = (id: string) => els.find((e) => e.kind === 'control' && e.controlId === id);
-  check('pmbql', 'native stages → sql elements (2)', sqlEls.length === 2);
+  // pmbql-native is a SIMPLE single-SELECT → auto-remodeled to a native model (no
+  // sql element); pmbql-native-tags has variable tags → stays a custom-SQL element.
+  check('pmbql', 'simple native stage → native model; tagged native stage stays sql (1 sql element)',
+    sqlEls.length === 1
+    && r.warnings.some((w) => /Daily Revenue \(pMBQL Native\).*auto-remodeled to a NATIVE Sigma data model/.test(w)));
   const tagged = sqlEls.find((e) => /JOIN CSA.TJ.CUSTOMER_DIM/.test(e.source.statement));
   check('pmbql', 'plain {{region}} kept verbatim (Sigma uses the same syntax) + text control emitted',
     /\{\{region\}\}/.test(tagged?.source.statement || '')
@@ -296,9 +300,8 @@ const nativeCard = read('top-customers-native.card.json');
   const els = r.workbook.pages.flatMap((p) => p.elements) as any[];
   const table = els.find((e) => e.name === 'Filtered Revenue (pMBQL Native + Tags)');
   const bar = els.find((e) => e.name === 'Weekly Orders by Region (pMBQL)');
-  check('pmbql-wb', 'parameters → controls (string/= list + date/range)',
-    (r.workbook.controls || []).some((c) => c.controlId === 'region_param' && c.controlType === 'list')
-    && (r.workbook.controls || []).some((c) => c.controlId === 'order_window' && c.controlType === 'date-range'));
+  check('pmbql-wb', 'date/range dimension parameter → live date-range control (real filter target)',
+    (r.workbook.controls || []).some((c) => c.controlId === 'order_window' && c.controlType === 'date-range'));
   check('pmbql-wb', 'variable + field-filter template-tag targets recorded in parameterWiring',
     (r.parameterWiring || []).some((w) => w.slug === 'region_param' && w.tag === 'region' && w.kind === 'variable')
     && (r.parameterWiring || []).some((w) => w.slug === 'order_date_param' && w.tag === 'order_date' && w.kind === 'field-filter'));
@@ -314,9 +317,9 @@ const nativeCard = read('top-customers-native.card.json');
   check('pmbql-wb', 'unwirable field-filter control NOT emitted (column missing from every mapped result set)',
     !(r.workbook.controls || []).some((c) => c.controlId === 'order_date_param')
     && r.warnings.some((w) => /order_date_param.*NOT emitted|control "Order Date".*NOT emitted/i.test(w)));
-  check('pmbql-wb', 'variable-tag control kept (DM-binding path) and recorded in the sidecar as dm-bound',
-    (r.workbook.controls || []).some((c) => c.controlId === 'region_param')
-    && /DM-parameter binding/.test(r.controlScope.controls.find((c) => c.controlId === 'region_param')?.sourceName || ''));
+  check('pmbql-wb', 'variable-tag-only control NOT emitted (DM-SQL {{tag}} binding is inert, live-disproven) and listed in unreproducibleFilters',
+    !(r.workbook.controls || []).some((c) => c.controlId === 'region_param')
+    && (r.unreproducibleFilters || []).some((u) => u.controlId === 'region_param' && /inert|pre-aggregation/.test(u.reason)));
   check('pmbql-wb', 'table.column_formatting single rule → conditionalFormats; range rule flagged',
     table?.conditionalFormats?.length === 1
     && table.conditionalFormats[0].condition === '>'
@@ -378,6 +381,56 @@ const nativeCard = read('top-customers-native.card.json');
   const a = readFileSync(join(here, 'pmbql-normalize.mjs'), 'utf8');
   const b = readFileSync(join(here, '..', '..', 'metabase-assessment', 'scripts', 'pmbql-normalize.mjs'), 'utf8');
   check('sync', 'converter + assessment pmbql-normalize.mjs copies are byte-identical', a === b);
+}
+
+// ── native-SQL → NATIVE-MODEL recognizer (auto-remodel + safety bails) ───────
+{
+  const meta = { tables: [
+    { id: 1, name: 'ORDER_FACT', schema: 'TJ', fields: [
+      { id: 101, name: 'CUSTOMER_KEY', base_type: 'type/Integer' },
+      { id: 102, name: 'NET_REVENUE', base_type: 'type/Float' }] },
+    { id: 2, name: 'CUSTOMER_DIM', schema: 'TJ', fields: [
+      { id: 201, name: 'CUSTOMER_KEY', base_type: 'type/Integer' },
+      { id: 202, name: 'REGION', base_type: 'type/Text' },
+      { id: 203, name: 'LAST_NAME', base_type: 'type/Text' }] }] };
+  const fidx = buildFieldIndex(meta);
+  const ff = (name: string, fid: number) => ({ [name]: { id: 't', name, 'display-name': name, type: 'dimension', dimension: ['field', fid, null], 'widget-type': 'string/=' } });
+  const card = (q: string, tags?: any) => ({ id: 9, name: 'Native', display: 'bar',
+    dataset_query: { type: 'native', database: 2, native: { query: q, 'template-tags': tags || {} } },
+    result_metadata: [{ name: 'REGION', display_name: 'Region' }, { name: 'NET_REVENUE', display_name: 'Net Revenue' }],
+    visualization_settings: { 'graph.dimensions': ['REGION'], 'graph.metrics': ['NET_REVENUE'] } });
+  const JOIN = 'from CSA.TJ.ORDER_FACT f join CSA.TJ.CUSTOMER_DIM c on f.CUSTOMER_KEY = c.CUSTOMER_KEY';
+
+  const simple = card(`select c.REGION as REGION, sum(f.NET_REVENUE) as NET_REVENUE ${JOIN} where {{last_name}} group by c.REGION`, ff('last_name', 203));
+  const rm = recognizeSimpleNativeSql(simple, fidx);
+  check('remodel', 'simple SELECT+JOIN+GROUP BY → structured native model + surfaces field-filter dim',
+    !!rm && rm.query['source-table'] === 1 && rm.query.joins?.length === 1 && rm.query.aggregation?.length === 1
+    && rm.resultMetadata.some((r: any) => r.name === 'LAST_NAME' && r.field_ref[1] === 203));
+  const dmR = convertMetabaseToSigma({ metadata: meta, cards: [simple] }, { connectionId: 'c', database: 'CSA' });
+  check('remodel', 'remodeled card emits a NATIVE element (join source), NO sql element',
+    !dmR.model.pages[0].elements.some((e: any) => e.source?.kind === 'sql')
+    && dmR.model.pages[0].elements.some((e: any) => e.source?.kind === 'join'));
+  // the field filter wires to a LIVE control with a real element-filter target
+  const dash = { name: 'D', parameters: [{ id: 'p', name: 'Last Name', slug: 'last_name', type: 'string/=', sectionId: 'string' }],
+    dashcards: [{ id: 1, card_id: 9, row: 0, col: 0, size_x: 12, size_y: 8, card: simple,
+      parameter_mappings: [{ parameter_id: 'p', card_id: 9, target: ['dimension', ['template-tag', 'last_name']] }] }] };
+  const wbR = convertMetabaseDashboardToSigma(dash, { metadata: meta });
+  const lnCtrl = (wbR.workbook.controls || []).find((c) => c.controlId === 'last_name') as any;
+  check('remodel', 'field-filter param → LIVE control with a real element-filter target (not dead furniture)',
+    !!lnCtrl && (lnCtrl.filters || []).length > 0 && !(wbR.unreproducibleFilters || []).some((u) => u.controlId === 'last_name'));
+
+  // SAFETY BAILS — never silently mistranslate
+  check('remodel', 'real WHERE predicate → bail to custom SQL (no silent filter drop)',
+    recognizeSimpleNativeSql(card(`select c.REGION as REGION, sum(f.NET_REVENUE) as NET_REVENUE ${JOIN} where f.NET_REVENUE > 100 and {{last_name}} group by c.REGION`, ff('last_name', 203)), fidx) === null);
+  check('remodel', 'LIMIT → bail', recognizeSimpleNativeSql(card('select c.REGION as REGION from CSA.TJ.CUSTOMER_DIM c group by c.REGION limit 10'), fidx) === null);
+  check('remodel', 'CASE / CTE / subquery / window → bail',
+    recognizeSimpleNativeSql(card('select case when 1=1 then 2 end as x from CSA.TJ.ORDER_FACT f'), fidx) === null
+    && recognizeSimpleNativeSql(card('with t as (select 1) select * from t'), fidx) === null
+    && recognizeSimpleNativeSql(card('select count(*) n from CSA.TJ.ORDER_FACT f where id in (select id from CSA.TJ.CUSTOMER_DIM c)'), fidx) === null);
+  check('remodel', 'variable (non-field-filter) tag → bail (needs custom-SQL substitution)',
+    recognizeSimpleNativeSql(card(`select c.REGION as REGION ${JOIN} where c.REGION = {{region}} group by c.REGION`, { region: { id: 't', name: 'region', type: 'text' } }), fidx) === null);
+  check('remodel', 'unknown table/column → bail', recognizeSimpleNativeSql(card('select x from NOPE.NOPE.NOPE n'), fidx) === null);
+  check('remodel', 'no metadata → bail (safe)', recognizeSimpleNativeSql(simple, undefined) === null);
 }
 
 // ── every fixture converts without throwing ──────────────────────────────────

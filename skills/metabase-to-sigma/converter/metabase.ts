@@ -53,12 +53,13 @@ export interface MetabaseFieldInfo {
   fkTargetFieldId?: number | null;
 }
 export interface MetabaseTableInfo { id: number; name: string; schema?: string; fields: MetabaseFieldInfo[]; }
-export interface FieldIndex { byId: Map<number, MetabaseFieldInfo>; tableById: Map<number, MetabaseTableInfo>; }
+export interface FieldIndex { byId: Map<number, MetabaseFieldInfo>; tableById: Map<number, MetabaseTableInfo>; tableByLeaf: Map<string, number>; }
 
 /** GET /api/database/{id}/metadata → field-id index (MBQL refs columns by integer id). */
 export function buildFieldIndex(metadata: any): FieldIndex {
   const byId = new Map<number, MetabaseFieldInfo>();
   const tableById = new Map<number, MetabaseTableInfo>();
+  const tableByLeaf = new Map<string, number>();
   for (const t of metadata?.tables || []) {
     const ti: MetabaseTableInfo = { id: t.id, name: t.name, schema: t.schema, fields: [] };
     for (const f of t.fields || []) {
@@ -73,8 +74,172 @@ export function buildFieldIndex(metadata: any): FieldIndex {
       ti.fields.push(fi); byId.set(f.id, fi);
     }
     tableById.set(t.id, ti);
+    if (t.name) tableByLeaf.set(String(t.name).toLowerCase(), t.id);
   }
-  return { byId, tableById };
+  return { byId, tableById, tableByLeaf };
+}
+
+// ── simple native-SQL → native-model recognizer ─────────────────────────────
+// A native-SQL card that is just a single SELECT over warehouse table(s) is
+// re-expressed as a structured (MBQL) query so it converts to a NATIVE Sigma
+// data model (table/join source, raw columns, aggregation metrics) instead of a
+// custom-SQL element. That is what makes its dashboard filters reproducible: the
+// underlying columns are exposed, so Sigma controls/element-filters work natively
+// (custom-SQL {{param}} filtering is inert from the workbook — live-disproven).
+// Returns a synthetic { 'source-table', joins?, aggregation?, breakout? } query,
+// or null when the SQL is too complex (CTE / subquery / CASE / window / set-op /
+// non-field-filter variable tag) — those fall back to a flagged custom-SQL element.
+const LEAF = (path: string) => String(path).trim().replace(/[`"\];]/g, '').split('.').pop()!.toLowerCase();
+const AGG_FN: Record<string, string> = { sum: 'sum', avg: 'avg', count: 'count', min: 'min', max: 'max', 'count_distinct': 'distinct', median: 'median', stddev: 'stddev' };
+
+export function recognizeSimpleNativeSql(card: any, fidx?: FieldIndex): any | null {
+  if (!fidx) return null;
+  const dq = card?.dataset_query;
+  if (!dq || dq.type !== 'native') return null;
+  let sql = String(dq.native?.query || '');
+  const tags: Record<string, any> = dq.native?.['template-tags'] || {};
+  if (!sql.trim()) return null;
+  sql = sql.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/--[^\n]*/g, ' ').replace(/\s+/g, ' ').trim();
+  // bail on anything we will not model faithfully
+  if (/^\s*with\b/i.test(sql)) return null;
+  if (/\b(union|intersect|except|having)\b/i.test(sql)) return null;
+  if (/\bover\s*\(/i.test(sql) || /\bcase\b/i.test(sql) || /\(\s*select\b/i.test(sql)) return null;
+  // only field-filter (dimension) tags are reproducible without custom SQL;
+  // a bare {{value}} variable tag needs SQL substitution → keep as custom SQL.
+  for (const t of Object.values(tags)) if (String(t?.type).toLowerCase() !== 'dimension') return null;
+
+  // split top-level clauses (safe: no subqueries past the guards above)
+  const find = (kw: RegExp) => { const m = kw.exec(sql); return m ? m.index : -1; };
+  if (!/^\s*select\b/i.test(sql)) return null;
+  const iFrom = find(/\bfrom\b/i); if (iFrom < 0) return null;
+  const iWhere = find(/\bwhere\b/i);
+  const iGroup = find(/\bgroup\s+by\b/i);
+  const iOrder = find(/\border\s+by\b/i);
+  const bound = (start: number) => {
+    const ends = [iWhere, iGroup, iOrder].filter((x) => x > start);
+    return ends.length ? Math.min(...ends) : sql.length;
+  };
+  const selectList = sql.slice(sql.search(/select\b/i) + 6, iFrom).trim();
+  const fromClause = sql.slice(iFrom + 4, bound(iFrom)).trim();
+  const groupClause = iGroup >= 0 ? sql.slice(iGroup + sql.slice(iGroup).match(/^group\s+by/i)![0].length, bound(iGroup)).trim() : '';
+  // WHERE must contain ONLY field-filter tags (which we surface as Sigma controls/
+  // element-filters) and trivial 1=1 / [[optional]] markers — anything else is a
+  // real predicate that the remodel would SILENTLY DROP (wrong numbers). Bail to
+  // custom SQL in that case (never silently mistranslate). Also bail on LIMIT.
+  const whereClause = iWhere >= 0 ? sql.slice(iWhere + 5, bound(iWhere)).trim() : '';
+  if (whereClause) {
+    const residual = whereClause
+      .replace(/\{\{\s*[^}]+\s*\}\}/g, ' ').replace(/\[\[|\]\]/g, ' ')
+      .replace(/\b1\s*=\s*1\b/g, ' ').replace(/\b(and|or)\b/gi, ' ')
+      .replace(/[()\s]+/g, '');
+    if (residual) return null;
+  }
+  if (/\blimit\b\s+\d/i.test(sql)) return null;
+
+  // FROM + JOINs → alias→tableId map (first source = base)
+  const aliasTable = new Map<string, number>();
+  let baseTableId: number | null = null;
+  const joins: any[] = [];
+  // tokenize: base then repeated "[type] join <path> [as] <alias> on <cond>"
+  const joinRe = /\b(?:(inner|left|right|full)\s+)?(?:outer\s+)?join\b/gi;
+  const firstJoin = sql.slice(iFrom).search(joinRe);
+  const baseSeg = (firstJoin < 0 ? fromClause : sql.slice(iFrom + 4, iFrom + firstJoin)).trim();
+  const parseRef = (seg: string): { tid: number; alias?: string } | null => {
+    const parts = seg.trim().split(/\s+/);
+    const tid = fidx.tableByLeaf?.get(LEAF(parts[0]));
+    if (tid == null) return null;
+    let alias: string | undefined;
+    if (parts.length >= 3 && /^as$/i.test(parts[1])) alias = parts[2];
+    else if (parts.length === 2) alias = parts[1];
+    return { tid, alias };
+  };
+  const baseRef = parseRef(baseSeg); if (!baseRef) return null;
+  baseTableId = baseRef.tid; if (baseRef.alias) aliasTable.set(baseRef.alias.toLowerCase(), baseRef.tid);
+  // walk joins
+  const joinClause = firstJoin < 0 ? '' : sql.slice(iFrom + firstJoin, bound(iFrom));
+  if (joinClause) {
+    const segRe = /\b(?:(inner|left|right|full)\s+)?(?:outer\s+)?join\b\s+([\s\S]+?)\s+on\s+([\s\S]+?)(?=\b(?:inner\s+|left\s+|right\s+|full\s+)?(?:outer\s+)?join\b|$)/gi;
+    let jm: RegExpExecArray | null;
+    while ((jm = segRe.exec(joinClause))) {
+      const [, jtype, jref, jcond] = jm;
+      const r = parseRef(jref); if (!r) return null;
+      if (r.alias) aliasTable.set(r.alias.toLowerCase(), r.tid);
+      const cm = /([\w.]+)\s*=\s*([\w.]+)/.exec(jcond); if (!cm) return null;
+      const resolveCol = (tok: string): any | null => {
+        const [a, c] = tok.includes('.') ? tok.split('.') : [undefined, tok];
+        const tid = a ? aliasTable.get(a.toLowerCase()) ?? baseTableId : baseTableId;
+        const f = tid != null ? fidx.tableById.get(tid)?.fields.find((x) => x.columnName.toLowerCase() === c.toLowerCase()) : undefined;
+        return f ? ['field', f.id, a && aliasTable.get(a.toLowerCase()) !== baseTableId ? { 'join-alias': a } : null] : null;
+      };
+      const L = resolveCol(cm[1]), R = resolveCol(cm[2]); if (!L || !R) return null;
+      joins.push({ 'source-table': r.tid, strategy: `${(jtype || 'left').toLowerCase()}-join`, alias: r.alias,
+        condition: ['=', L, R] });
+    }
+  }
+
+  // resolve a "[alias.]col" token to a field ref
+  const colRef = (tok: string): any | null => {
+    const [a, c] = tok.includes('.') ? tok.split('.') : [undefined, tok];
+    const tid = a ? aliasTable.get(a.toLowerCase()) : baseTableId;
+    if (tid == null) return null;
+    const f = fidx.tableById.get(tid)?.fields.find((x) => x.columnName.toLowerCase() === c.replace(/[`"]/g, '').toLowerCase());
+    return f ? ['field', f.id, a && tid !== baseTableId ? { 'join-alias': a } : null] : null;
+  };
+
+  // SELECT list → aggregations + plain dimensions. Track each item's output ALIAS
+  // (explicit `as X`, else the column/function name) so the dashboard can re-map
+  // the card's viz settings (graph.dimensions/metrics reference these aliases).
+  const items = selectList.split(/,(?![^(]*\))/).map((s) => s.trim());
+  if (items.some((s) => !s)) return null;   // trailing/empty comma (e.g. BQ `…, from`) — don't trust the parse; keep verbatim SQL
+  const aggregation: any[] = [];
+  const breakout: any[] = [];
+  const resultMetadata: any[] = [];
+  const explicitAlias = (it: string): string | null => { const m = /\s+as\s+(["`\w]+)\s*$/i.exec(it); return m ? m[1].replace(/["`]/g, '') : null; };
+  for (const it of items) {
+    const expr = it.replace(/\s+as\s+["`\w]+\s*$/i, '').trim();
+    const am = /^(\w+)\s*\(\s*(distinct\s+)?(.+?)\s*\)$/i.exec(expr);
+    if (am && AGG_FN[am[1].toLowerCase()]) {
+      const fn = AGG_FN[(am[2] ? 'count_distinct' : am[1]).toLowerCase()] || AGG_FN[am[1].toLowerCase()];
+      const arg = am[3].trim();
+      const aggIdx = aggregation.length;
+      if (arg === '*' || /^\d+$/.test(arg)) aggregation.push(['count']);
+      else { const ref = colRef(arg); if (!ref) return null; aggregation.push([fn, ref]); }
+      const alias = explicitAlias(it) || am[1].toLowerCase();
+      resultMetadata.push({ name: alias, display_name: alias, field_ref: ['aggregation', aggIdx] });
+      continue;
+    }
+    if (!/^[\w.`"]+$/.test(expr)) return null;       // reject non-trivial expressions
+    const ref = colRef(expr); if (!ref) return null;
+    const alias = explicitAlias(it) || expr.split('.').pop()!.replace(/[`"]/g, '');
+    breakout.push(ref);
+    resultMetadata.push({ name: alias, display_name: alias, field_ref: ref });
+  }
+  // If a GROUP BY is present it defines the dimension grain; honor it (ordinals
+  // map to the Nth select item). Otherwise the SELECT dims are the breakout.
+  if (groupClause) {
+    breakout.length = 0;
+    for (const g of groupClause.split(/,(?![^(]*\))/).map((s) => s.trim()).filter(Boolean)) {
+      if (/^\d+$/.test(g)) { const rm = resultMetadata[Number(g) - 1]; if (rm && Array.isArray(rm.field_ref) && rm.field_ref[0] === 'field') breakout.push(rm.field_ref); continue; }
+      const ref = colRef(g); if (!ref) return null;
+      breakout.push(ref);
+    }
+  }
+  // Surface every field-filter tag's mapped column as an extra breakout dimension
+  // (so it lands in the result set + the element exposes it) — that is what lets
+  // the dashboard reproduce the filter as a native Sigma control/element-filter.
+  // It is NOT added to the viz, so it never becomes an unwanted chart axis.
+  for (const t of Object.values(tags)) {
+    const dim = (t as any).dimension;
+    const fid = Array.isArray(dim) && dim[0] === 'field' && typeof dim[1] === 'number' ? dim[1] : null;
+    if (fid == null || resultMetadata.some((rm) => Array.isArray(rm.field_ref) && rm.field_ref[1] === fid)) continue;
+    const f = fidx.byId.get(fid); if (!f) continue;
+    breakout.push(dim);
+    resultMetadata.push({ name: f.columnName, display_name: f.columnName, field_ref: dim });
+  }
+
+  const query = { database: dq.database, 'source-table': baseTableId, ...(joins.length ? { joins } : {}),
+    ...(aggregation.length ? { aggregation } : {}), ...(breakout.length ? { breakout } : {}) };
+  return { query, resultMetadata };
 }
 
 // ── MBQL expression tree → Sigma formula ─────────────────────────────────────
@@ -618,7 +783,16 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
     if (card.id != null && inFlight.has(card.id)) { warnings.push(`card ${card.id} participates in a circular card__ reference chain — skipped.`); return; }
     if (card.id != null) inFlight.add(card.id);
     const done = () => { if (card.id != null) inFlight.delete(card.id); };
-    const dq = card.dataset_query || {};
+    let dq = card.dataset_query || {};
+    // Simple native SQL → native Sigma data model (so filters are reproducible
+    // natively — see recognizeSimpleNativeSql). Complex SQL stays custom SQL below.
+    if (dq.type === 'native') {
+      const remodeled = recognizeSimpleNativeSql(card, fidx);
+      if (remodeled) {
+        dq = { type: 'query', database: dq.database, query: remodeled.query };
+        warnings.push(`card "${card.name}": simple native SQL auto-remodeled to a NATIVE Sigma data model (table/join source + aggregation) — its columns are exposed so dashboard filters reproduce as native Sigma controls/element-filters (no custom SQL).`);
+      }
+    }
     const ctxM = mkMbqlCtx(card);
 
     // ── native SQL card → sql-source element (statement near-verbatim, NO element name) ──
