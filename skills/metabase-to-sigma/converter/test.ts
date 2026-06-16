@@ -431,6 +431,17 @@ const nativeCard = read('top-customers-native.card.json');
     recognizeSimpleNativeSql(card(`select c.REGION as REGION ${JOIN} where c.REGION = {{region}} group by c.REGION`, { region: { id: 't', name: 'region', type: 'text' } }), fidx) === null);
   check('remodel', 'unknown table/column → bail', recognizeSimpleNativeSql(card('select x from NOPE.NOPE.NOPE n'), fidx) === null);
   check('remodel', 'no metadata → bail (safe)', recognizeSimpleNativeSql(simple, undefined) === null);
+
+  // trailing semicolon must be stripped from custom-SQL fallback (Sigma wraps the
+  // statement as a subquery → trailing `;` is a POST syntax error). CTE → not remodeled.
+  const semi = { id: 7, name: 'Semi', display: 'table',
+    dataset_query: { type: 'native', database: 2, native: {
+      query: 'with t as (select region from CSA.TJ.CUSTOMER_DIM) select * from t order by region;', 'template-tags': {} } },
+    result_metadata: [{ name: 'region', display_name: 'Region' }] };
+  const semiR = convertMetabaseToSigma({ metadata: meta, cards: [semi] }, { connectionId: 'c', database: 'CSA' });
+  const semiEl = semiR.model.pages[0].elements.find((e: any) => e.source?.kind === 'sql');
+  check('remodel', 'custom-SQL fallback strips trailing semicolon (no subquery-wrap break)',
+    !!semiEl && !/;\s*$/.test(semiEl.source.statement) && /order by region$/i.test(semiEl.source.statement.trim()));
 }
 
 // ── every fixture converts without throwing ──────────────────────────────────
