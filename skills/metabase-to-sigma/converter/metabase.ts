@@ -774,6 +774,10 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
         warnings.push(`card "${card.name}": native {{${tagName}}} (${ttype}) — a Sigma ${controlType} control "${display}" (controlId "${tagName}") was emitted; the {{${tagName}}} reference is kept verbatim (Sigma custom SQL uses the same {{control-id}} parameter syntax). Verify the control's default${tag?.required ? ' (tag is REQUIRED — set a default or the element errors until set)' : ''}.`);
       }
     }
+    // 3. Strip trailing semicolon(s): Sigma wraps a custom-SQL element's statement
+    // as a subquery `( … )`, so a trailing `;` is a syntax error at POST
+    // (live-verified on BigQuery: `Expected ")" but got ";"`). Metabase tolerates it.
+    sql = sql.replace(/;\s*$/, '').trimEnd();
     return sql;
   };
 
