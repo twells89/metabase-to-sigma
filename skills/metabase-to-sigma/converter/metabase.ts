@@ -36,15 +36,66 @@ import { normalizeCard } from './pmbql-normalize.mjs';
 
 export interface LearnedRule { pattern: string; template: string; flags?: string }
 
+export type WarehouseDialect = 'bigquery' | 'snowflake' | 'databricks' | 'redshift' | 'postgres' | 'mysql' | 'athena' | 'unknown';
+
 export interface MetabaseConvertOptions {
   connectionId?: string;
   database?: string;       // warehouse database for source paths (e.g. CSA)
   schema?: string;         // overrides table.schema when set
   modelName?: string;
+  warehouse?: WarehouseDialect;  // drives SQL dialect transforms (array agg, etc.)
   // Customer-discovered translation rules (gap-scout, ~/.metabase-to-sigma/learned-rules.json).
   // Applied BEFORE the built-in translator: a rule whose regex matches the FULL
   // JSON serialization of an MBQL node wins (template may use $1.. captures).
   learnedRules?: LearnedRule[];
+}
+
+/**
+ * Apply warehouse-specific SQL transforms to a native SQL statement.
+ * Called after tag rewriting, before the statement is written to the spec.
+ *
+ * Currently handles the single most common rendering failure:
+ *   Array aggregations — Sigma cannot display array/nested types in table cells.
+ *   Each warehouse has a different string-aggregation idiom.
+ */
+export function applyWarehouseTransforms(sql: string, warehouse: WarehouseDialect): string {
+  switch (warehouse) {
+    case 'bigquery':
+      // ARRAY_AGG(x [IGNORE NULLS]) → array_to_string(ARRAY_AGG(x [IGNORE NULLS]), ', ')
+      // Skip if already wrapped to avoid double-wrapping on re-runs.
+      return sql.replace(
+        /\bARRAY_AGG\s*(\([^)]+(?:\s+IGNORE\s+NULLS)?\)(?:\s+IGNORE\s+NULLS)?)/gi,
+        (m) => m.toLowerCase().includes('array_to_string') ? m : `array_to_string(${m}, ', ')`,
+      );
+    case 'snowflake':
+      // Snowflake ARRAY_AGG returns VARIANT — Sigma renders it as "[object]".
+      // LISTAGG is simpler and returns a plain string.
+      return sql.replace(
+        /\bARRAY_AGG\s*\(([^)]+)\)/gi,
+        (_m, arg) => `LISTAGG(${arg}, ', ')`,
+      );
+    case 'databricks':
+      // collect_list(x) returns an array type — wrap in array_join.
+      return sql.replace(
+        /\bcollect_list\s*\(([^)]+)\)/gi,
+        (_m, arg) => `array_join(collect_list(${arg}), ', ')`,
+      );
+    case 'redshift':
+    case 'postgres':
+      // STRING_AGG is ANSI and works on both.
+      return sql.replace(
+        /\bARRAY_AGG\s*\(([^)]+)\)/gi,
+        (_m, arg) => `STRING_AGG(CAST(${arg} AS VARCHAR), ', ')`,
+      );
+    case 'athena':
+      // Athena (Trino): array_join(array_agg(x), ', ')
+      return sql.replace(
+        /\bARRAY_AGG\s*\(([^)]+)\)/gi,
+        (_m, arg) => `array_join(array_agg(${arg}), ', ')`,
+      );
+    default:
+      return sql;
+  }
 }
 
 export interface MetabaseFieldInfo {
@@ -774,7 +825,11 @@ export function convertMetabaseToSigma(input: string | object, options: Metabase
         warnings.push(`card "${card.name}": native {{${tagName}}} (${ttype}) — a Sigma ${controlType} control "${display}" (controlId "${tagName}") was emitted; the {{${tagName}}} reference is kept verbatim (Sigma custom SQL uses the same {{control-id}} parameter syntax). Verify the control's default${tag?.required ? ' (tag is REQUIRED — set a default or the element errors until set)' : ''}.`);
       }
     }
-    // 3. Strip trailing semicolon(s): Sigma wraps a custom-SQL element's statement
+    // 3. Warehouse-specific SQL transforms (array agg → string agg, etc.)
+    if (opts.warehouse && opts.warehouse !== 'unknown') {
+      sql = applyWarehouseTransforms(sql, opts.warehouse);
+    }
+    // 4. Strip trailing semicolon(s): Sigma wraps a custom-SQL element's statement
     // as a subquery `( … )`, so a trailing `;` is a syntax error at POST
     // (live-verified on BigQuery: `Expected ")" but got ";"`). Metabase tolerates it.
     sql = sql.replace(/;\s*$/, '').trimEnd();

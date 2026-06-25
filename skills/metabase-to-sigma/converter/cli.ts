@@ -15,8 +15,29 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { convertMetabaseToSigma } from './metabase.js';
+import { convertMetabaseToSigma, applyWarehouseTransforms, type WarehouseDialect } from './metabase.js';
 import { convertMetabaseDashboardToSigma } from './metabase-dashboard.js';
+
+// Map Sigma connection type strings → our WarehouseDialect enum.
+const SIGMA_TYPE_MAP: Record<string, WarehouseDialect> = {
+  bigquery: 'bigquery', snowflake: 'snowflake', databricks: 'databricks',
+  redshift: 'redshift', postgres: 'postgres', postgresql: 'postgres',
+  mysql: 'mysql', athena: 'athena',
+};
+
+async function detectWarehouse(connectionId: string): Promise<WarehouseDialect> {
+  const base = process.env.SIGMA_BASE_URL?.replace(/\/$/, '');
+  const token = process.env.SIGMA_API_TOKEN;
+  if (!base || !token || !connectionId || connectionId === '<CONNECTION_ID>') return 'unknown';
+  try {
+    const res = await fetch(`${base}/v2/connections/${connectionId}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    });
+    const json = await res.json() as any;
+    const type = String(json?.type || json?.connectionType || '').toLowerCase();
+    return SIGMA_TYPE_MAP[type] ?? 'unknown';
+  } catch { return 'unknown'; }
+}
 
 // Gap-scout learned rules (validated, customer-discovered translations) live in the
 // customer's home dir so a skill `git pull` never clobbers them. Applied before the
@@ -42,6 +63,15 @@ const metadataFile = opt('metadata');
 const metadata = metadataFile ? JSON.parse(readFileSync(metadataFile, 'utf8')) : undefined;
 const learnedRules = loadLearnedRules();
 
+const connectionId = opt('connection', '<CONNECTION_ID>');
+// --warehouse explicit > auto-detect from Sigma connection API > unknown (no transforms)
+const warehouseArg = opt('warehouse') as WarehouseDialect | '';
+const warehouse: WarehouseDialect = warehouseArg
+  ? (SIGMA_TYPE_MAP[warehouseArg.toLowerCase()] ?? warehouseArg as WarehouseDialect)
+  : await detectWarehouse(connectionId);
+if (warehouse !== 'unknown') console.error(`[warehouse] dialect: ${warehouse}`);
+else console.error(`[warehouse] dialect unknown — pass --warehouse <bigquery|snowflake|databricks|redshift|postgres|athena> to enable SQL transforms`);
+
 const isDashboard = !!(raw.dashcards || raw.ordered_cards);
 let res: any;
 if (isDashboard) {
@@ -50,7 +80,7 @@ if (isDashboard) {
   const cards = Array.isArray(raw) ? raw : raw.cards ? raw.cards : raw.dataset_query ? [raw] : [];
   res = convertMetabaseToSigma(
     { metadata: metadata ?? raw.metadata, cards, sandboxes: raw.sandboxes },
-    { connectionId: opt('connection', '<CONNECTION_ID>'), database: opt('database'), schema: opt('schema'), learnedRules },
+    { connectionId, database: opt('database'), schema: opt('schema'), warehouse, learnedRules },
   );
 }
 

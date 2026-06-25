@@ -55,6 +55,12 @@ viz, click behaviors) instead of emitting wrong logic.
   means something when the Sigma connection reaches the database Metabase queries.
   (Metabase's bundled H2 Sample Database is NOT reachable from Sigma — pick content
   on a real warehouse, or land the data first.)
+- **Know your warehouse dialect.** The converter auto-detects it from the Sigma connection
+  (`--connection <id>` triggers a `GET /v2/connections/<id>` lookup), or pass `--warehouse`
+  explicitly: `bigquery` | `snowflake` | `databricks` | `redshift` | `postgres` | `athena`.
+  Required for correct array-aggregation rewrites (BigQuery `ARRAY_AGG` → `array_to_string`,
+  Snowflake → `LISTAGG`, Databricks `collect_list` → `array_join`, etc.). Without it,
+  native SQL cards with array aggregations will render as blank cells in Sigma.
 - **Node** for the converter (`converter/`: `npm install` once).
 
 ---
