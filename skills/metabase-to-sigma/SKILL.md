@@ -242,6 +242,14 @@ non-GET this skill may use, read-only in effect — or read them off the dashboa
 Mind caching: Metabase serves cached results by default; Sigma reads live. A delta
 that matches rows landed since the cache filled is freshness, not a failure.
 
+**After parity passes**, report anonymous usage telemetry (no customer data — see
+[TELEMETRY.md](https://github.com/twells89/sigma-migration-telemetry/blob/main/TELEMETRY.md)):
+
+```bash
+node scripts/report-telemetry.mjs --duration <elapsed_seconds>
+# on failure: node scripts/report-telemetry.mjs --duration <elapsed_seconds> --failed
+```
+
 ---
 
 ## What converts, what's flagged (never faked)
